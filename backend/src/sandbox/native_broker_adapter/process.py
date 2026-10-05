@@ -1,0 +1,313 @@
+"""Restricted Windows child-process wrapper and pipe I/O."""
+
+from __future__ import annotations
+
+import subprocess
+import threading
+from collections.abc import Mapping
+from pathlib import PureWindowsPath
+from typing import Any
+
+from ..errors import SandboxInitializationError
+from ..native_windows import WindowsJobObject
+from ..native_windows.api import _modules
+
+
+class _NativeWindowsProcess:
+    def __init__(
+        self,
+        *,
+        process_handle: Any,
+        thread_handle: Any,
+        pid: int,
+        stdin_handle: Any,
+        stdout_handle: Any,
+        stderr_handle: Any,
+        job: WindowsJobObject,
+        audit_identity: Mapping[str, Any],
+    ) -> None:
+        self.process_handle = process_handle
+        self.thread_handle = thread_handle
+        self.pid = pid
+        self.stdin_handle = stdin_handle
+        self.stdout_handle = stdout_handle
+        self.stderr_handle = stderr_handle
+        self.job = job
+        self.audit_identity = dict(audit_identity)
+        self.returncode: int | None = None
+        self._stdin_closed = False
+        self._lock = threading.RLock()
+        self._modules = _modules()
+        self.output_bytes = 0
+        self._reader_threads: tuple[threading.Thread, ...] = ()
+        self._output_chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+
+    @classmethod
+    def launch(
+        cls,
+        token: Any,
+        argv: list[str],
+        cwd: str,
+        environment: Mapping[str, str],
+        job: WindowsJobObject,
+        *,
+        logon_sid: str,
+        service_sid: str,
+        desktop_name: str,
+    ) -> _NativeWindowsProcess:
+        modules = _modules()
+        pipe = modules["pipe"]
+        api = modules["api"]
+        process = modules["process"]
+        pipe_attributes = _object_security_attributes(logon_sid, service_sid)
+        pipe_attributes.bInheritHandle = True
+        child_stdin, parent_stdin = pipe.CreatePipe(pipe_attributes, 0)
+        parent_stdout, child_stdout = pipe.CreatePipe(pipe_attributes, 0)
+        parent_stderr, child_stderr = pipe.CreatePipe(pipe_attributes, 0)
+        for handle in (parent_stdin, parent_stdout, parent_stderr):
+            api.SetHandleInformation(handle, modules["con"].HANDLE_FLAG_INHERIT, 0)
+        startup = process.STARTUPINFO()
+        startup.dwFlags |= modules["con"].STARTF_USESTDHANDLES
+        startup.hStdInput = child_stdin
+        startup.hStdOutput = child_stdout
+        startup.hStdError = child_stderr
+        startup.lpDesktop = desktop_name
+        flags = _process_creation_flags(modules["con"])
+        process_attributes = _object_security_attributes(logon_sid, service_sid)
+        thread_attributes = _object_security_attributes(logon_sid, service_sid)
+        process_handle = None
+        thread_handle = None
+        try:
+            process_handle, thread_handle, pid, _ = process.CreateProcessAsUser(
+                token,
+                None,
+                _windows_command_line(argv),
+                process_attributes,
+                thread_attributes,
+                True,
+                flags,
+                dict(environment),
+                cwd,
+                startup,
+            )
+            job.assign(process_handle)
+            # The process DACL intentionally excludes the backend. The Broker
+            # already owns a creation handle: inspect its real token while the
+            # child is suspended, before even a short command can exit.
+            audit_identity = _process_audit_identity(process_handle, int(pid), logon_sid)
+            process.ResumeThread(thread_handle)
+        except Exception:
+            job.terminate()
+            job.close()
+            for handle in (thread_handle, process_handle):
+                if handle is not None:
+                    try:
+                        api.CloseHandle(handle)
+                    except Exception:
+                        pass
+            raise
+        finally:
+            for handle in (child_stdin, child_stdout, child_stderr):
+                try:
+                    api.CloseHandle(handle)
+                except Exception:
+                    pass
+        return cls(
+            process_handle=process_handle,
+            thread_handle=thread_handle,
+            pid=int(pid),
+            stdin_handle=parent_stdin,
+            stdout_handle=parent_stdout,
+            stderr_handle=parent_stderr,
+            job=job,
+            audit_identity=audit_identity,
+        )
+
+    def poll(self) -> int | None:
+        with self._lock:
+            if self.returncode is not None:
+                return self.returncode
+            result = self._modules["event"].WaitForSingleObject(self.process_handle, 0)
+            if result == self._modules["con"].WAIT_TIMEOUT:
+                return None
+            self.returncode = int(self._modules["process"].GetExitCodeProcess(self.process_handle))
+            return self.returncode
+
+    def wait(self, timeout: float | None) -> int | None:
+        milliseconds = self._modules["event"].INFINITE if timeout is None else max(0, int(timeout * 1000))
+        result = self._modules["event"].WaitForSingleObject(self.process_handle, milliseconds)
+        if result == self._modules["con"].WAIT_TIMEOUT:
+            return None
+        return self.poll()
+
+    def read(self, stream: str, size: int) -> bytes:
+        handle = self.stdout_handle if stream == "stdout" else self.stderr_handle
+        try:
+            _, value = self._modules["file"].ReadFile(handle, max(1, min(size, 1024 * 1024)))
+            result = bytes(value)
+            with self._lock:
+                self.output_bytes += len(result)
+            return result
+        except Exception as exc:
+            if getattr(exc, "winerror", None) in {109, 232}:
+                return b""
+            raise OSError("Broker process stream read failed") from exc
+
+    def write(self, value: bytes) -> int:
+        if self._stdin_closed:
+            raise OSError("Broker process stdin is closed")
+        try:
+            _, written = self._modules["file"].WriteFile(self.stdin_handle, value)
+            return int(written) if isinstance(written, int) else len(value)
+        except Exception as exc:
+            raise OSError("Broker process stream write failed") from exc
+
+    def close_stdin(self) -> None:
+        with self._lock:
+            if self._stdin_closed:
+                return
+            self._modules["api"].CloseHandle(self.stdin_handle)
+            self._stdin_closed = True
+            self.stdin_handle = None
+
+    def communicate(self, input_value: bytes | None, timeout: float | None) -> tuple[int | None, bytes, bytes]:
+        if input_value:
+            self.write(input_value)
+        self.close_stdin()
+        self._ensure_readers()
+        code = self.wait(timeout)
+        if code is not None:
+            for thread in self._reader_threads:
+                thread.join(timeout=5.0)
+        with self._lock:
+            return (
+                code,
+                b"".join(self._output_chunks["stdout"]),
+                b"".join(self._output_chunks["stderr"]),
+            )
+
+    def _ensure_readers(self) -> None:
+        with self._lock:
+            if self._reader_threads:
+                return
+
+            def drain(stream: str) -> None:
+                while True:
+                    value = self.read(stream, 65536)
+                    if not value:
+                        return
+                    with self._lock:
+                        self._output_chunks[stream].append(value)
+
+            self._reader_threads = tuple(
+                threading.Thread(
+                    target=drain,
+                    args=(name,),
+                    name=f"sandbox-{self.pid}-{name}",
+                    daemon=True,
+                )
+                for name in ("stdout", "stderr")
+            )
+            for thread in self._reader_threads:
+                thread.start()
+
+    def terminate(self) -> int | None:
+        if self.job is None:
+            return self.returncode
+        self.job.terminate()
+        return self.wait(5.0)
+
+    def close(self) -> None:
+        failures: list[Exception] = []
+        try:
+            self.terminate()
+        except Exception as exc:
+            failures.append(exc)
+        for thread in self._reader_threads:
+            thread.join(timeout=5.0)
+        for name in ("stdin_handle", "stdout_handle", "stderr_handle", "thread_handle", "process_handle"):
+            handle = getattr(self, name)
+            if handle is None:
+                continue
+            try:
+                self._modules["api"].CloseHandle(handle)
+            except Exception as exc:
+                failures.append(exc)
+            else:
+                setattr(self, name, None)
+                if name == "stdin_handle":
+                    self._stdin_closed = True
+        if self.job is not None:
+            try:
+                self.job.close()
+            except Exception as exc:
+                failures.append(exc)
+            else:
+                self.job = None
+        if failures:
+            raise SandboxInitializationError("Broker process handles could not be closed") from failures[0]
+
+
+def _process_audit_identity(process_handle: Any, pid: int, logon_sid: str) -> dict[str, Any]:
+    security = _modules()["security"]
+    token = None
+    try:
+        token = security.OpenProcessToken(process_handle, security.TOKEN_QUERY)
+        user, _ = security.GetTokenInformation(token, security.TokenUser)
+        groups = security.GetTokenInformation(token, security.TokenGroups)
+        if not any(security.ConvertSidToStringSid(sid) == logon_sid for sid, _ in groups):
+            raise SandboxInitializationError("Created command token does not match the reserved logon SID")
+        # LUA_TOKEN may change AuthenticationId while preserving the logon SID.
+        logon_id = int(security.GetTokenInformation(token, security.TokenStatistics)["AuthenticationId"])
+        if pid <= 0 or not 0 < logon_id <= 0xFFFFFFFFFFFFFFFF:
+            raise SandboxInitializationError("Created command audit identity is invalid")
+        return {
+            "pid": pid,
+            "account_sid": security.ConvertSidToStringSid(user),
+            "logon_sid": logon_sid,
+            "logon_id": logon_id,
+        }
+    except SandboxInitializationError:
+        raise
+    except Exception as exc:
+        raise SandboxInitializationError("Broker cannot inspect the created command audit identity") from exc
+    finally:
+        if token is not None:
+            token.Close()
+
+
+def _object_security_attributes(logon_sid: str, service_sid: str) -> Any:
+    modules = _modules()
+    security = modules["security"]
+    attributes = modules["types"].SECURITY_ATTRIBUTES()
+    descriptor = modules["types"].SECURITY_DESCRIPTOR()
+    acl = security.ACL()
+    full = modules["con"].GENERIC_ALL
+    for sid in (
+        security.ConvertStringSidToSid(logon_sid),
+        security.CreateWellKnownSid(security.WinLocalSystemSid, None),
+        security.ConvertStringSidToSid(service_sid),
+    ):
+        acl.AddAccessAllowedAce(security.ACL_REVISION, full, sid)
+    descriptor.SetSecurityDescriptorDacl(1, acl, 0)
+    attributes.SECURITY_DESCRIPTOR = descriptor
+    return attributes
+
+
+def _windows_command_line(argv: list[str]) -> str:
+    """Encode argv while preserving cmd.exe's non-CRT /c quoting rules."""
+
+    executable = PureWindowsPath(argv[0]).name.casefold()
+    if executable in {"cmd", "cmd.exe"} and len(argv) >= 3 and argv[-2].casefold() in {"/c", "/k"}:
+        command = argv[-1]
+        if "\x00" in command:
+            raise SandboxInitializationError("Broker command contains an invalid character")
+        return f'{subprocess.list2cmdline(argv[:-1])} "{command}"'
+    return subprocess.list2cmdline(argv)
+
+
+def _process_creation_flags(constants: Any) -> int:
+    # CREATE_NO_WINDOW is intentionally absent. Restricted PowerShell and CLR
+    # processes fail during DLL initialization in that mode; the Broker's
+    # private non-interactive desktop already prevents visible UI.
+    return int(constants.CREATE_SUSPENDED | constants.CREATE_UNICODE_ENVIRONMENT)

@@ -1,0 +1,412 @@
+"""Persistent right-panel windows and interactive terminal transport."""
+
+from __future__ import annotations
+
+import asyncio
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, ConfigDict, Field
+
+from backend.api.error_handlers import error_response
+from backend.domain import MessageQueueUnavailable, RightPanelWindow
+from backend.domain.runtime_state import RuntimeRootState, RuntimeState, new_thread_id
+from backend.domain.state import utc_now
+from backend.domain.terminal import TERMINAL_LABELS
+from backend.tools.terminal import available_terminal_executables
+
+from ..security import LocalWebSettings, browser_origin_allowed
+from ..session_store import require_active_session, session_store
+from ..state import WebAppState
+
+router = APIRouter(prefix="/api/right-panel", tags=["right-panel"])
+
+
+class RightPanelStatePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    width: int | None = Field(default=None, ge=0, le=100_000)
+    collapsed: bool | None = None
+    active_window_id: str | None = Field(default=None, max_length=200)
+
+
+class CreatePanelWindowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_turn_id: str = Field(min_length=1, max_length=200)
+
+
+class RenamePanelWindowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=120)
+
+
+def _turn(store, session_id: str, turn_id: str, owner_thread_id: str) -> RuntimeState:
+    item = store.get_node(session_id, turn_id)
+    if item is None or isinstance(item, RuntimeRootState) or item.session_id != session_id:
+        raise HTTPException(status_code=404, detail="未知 Turn。")
+    if item.thread_id != owner_thread_id:
+        raise HTTPException(status_code=409, detail="侧聊只能从主聊天当前 Turn 创建。")
+    return item
+
+
+def _window(store, session_id: str, window_id: str, owner_thread_id: str) -> RightPanelWindow:
+    item = store.get_right_panel_window(session_id, window_id)
+    if item is None or not item.active or (item.owner_thread_id or session_id) != owner_thread_id:
+        raise HTTPException(status_code=404, detail="未知右栏窗口。")
+    return item
+
+
+def _panel_thread(store, session_id: str, thread_id: str | None) -> str:
+    owner = thread_id or session_id
+    if owner != session_id:
+        thread = store.get_sidebar_thread(owner, session_id=session_id)
+        if thread is None or thread.state != "active":
+            raise HTTPException(status_code=404, detail="未知对话。")
+    return owner
+
+
+def _payload(state: WebAppState, session_id: str, thread_id: str) -> dict[str, object]:
+    store = session_store(state)
+    windows = store.list_right_panel_windows(session_id, owner_thread_id=thread_id)
+    stale = [
+        item
+        for item in windows
+        if item.kind == "terminal"
+        and item.terminal_id is not None
+        and state.terminal_manager.get(item.terminal_id) is None
+    ]
+    for item in stale:
+        store.update_right_panel_window(session_id, item.id, deleted_at=utc_now())
+    if stale:
+        windows = store.list_right_panel_windows(session_id, owner_thread_id=thread_id)
+    panel = store.get_right_panel_state(session_id, thread_id=thread_id)
+    active_ids = {item.id for item in windows}
+    if panel.active_window_id not in active_ids:
+        active_window_id = windows[0].id if windows else None
+        panel = store.save_right_panel_state(session_id, active_window_id=active_window_id, thread_id=thread_id)
+    terminal_type = state.settings.runtime_config().get("terminal_type", "cmd")
+    terminal_available = terminal_type in available_terminal_executables()
+    terminal_reason = (
+        None
+        if terminal_available
+        else f"配置的终端 {TERMINAL_LABELS.get(str(terminal_type), terminal_type)} 当前不可用。"
+    )
+    return {
+        "state": panel.to_dict(),
+        "windows": [item.to_dict() for item in windows],
+        "capabilities": {
+            "terminal_available": terminal_available,
+            "terminal_unavailable_reason": terminal_reason,
+        },
+    }
+
+
+@router.get("/{session_id}")
+def get_right_panel(session_id: str, request: Request, thread_id: str | None = None) -> dict[str, object]:
+    store = session_store(request.app.state.web)
+    require_active_session(store, session_id)
+    return _payload(request.app.state.web, session_id, _panel_thread(store, session_id, thread_id))
+
+
+@router.patch("/{session_id}")
+def update_right_panel(
+    session_id: str,
+    body: RightPanelStatePatch,
+    request: Request,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    store = session_store(request.app.state.web)
+    require_active_session(store, session_id)
+    owner = _panel_thread(store, session_id, thread_id)
+    kwargs: dict[str, object] = {"thread_id": owner}
+    if "width" in body.model_fields_set:
+        kwargs["width"] = body.width
+    if "collapsed" in body.model_fields_set:
+        kwargs["collapsed"] = body.collapsed
+    if "active_window_id" in body.model_fields_set:
+        if body.active_window_id is not None:
+            _window(store, session_id, body.active_window_id, owner)
+        kwargs["active_window_id"] = body.active_window_id
+    store.save_right_panel_state(session_id, **kwargs)
+    return _payload(request.app.state.web, session_id, owner)
+
+
+@router.post("/{session_id}/side-chats", status_code=201)
+def create_side_chat(
+    session_id: str,
+    body: CreatePanelWindowRequest,
+    request: Request,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    state: WebAppState = request.app.state.web
+    store = session_store(state)
+    require_active_session(store, session_id)
+    owner = _panel_thread(store, session_id, thread_id)
+    source = _turn(store, session_id, body.source_turn_id, owner)
+    thread_id = new_thread_id()
+    anchor = store.build_side_chat_anchor(source.id, thread_id=thread_id)
+    all_windows = store.list_right_panel_windows(session_id, include_deleted=True, owner_thread_id=owner)
+    number = sum(item.kind == "side_chat" for item in all_windows) + 1
+    now = utc_now()
+    window = RightPanelWindow(
+        id=f"window_{uuid4().hex}",
+        session_id=session_id,
+        kind="side_chat",
+        owner_thread_id=owner,
+        title=f"侧聊 {number}",
+        position=len(all_windows),
+        created_at=now,
+        updated_at=now,
+        thread_id=thread_id,
+        anchor_turn_id=anchor.id,
+    )
+    try:
+        store.create_side_chat_window(window, anchor)
+        store.save_right_panel_state(session_id, collapsed=False, active_window_id=window.id, thread_id=owner)
+    except (RuntimeError, ValueError) as exc:
+        return error_response(exc, status_code=409, detail=str(exc))
+    return {"window": window.to_dict(), "anchor": anchor.to_dict()}
+
+
+@router.post("/{session_id}/terminals", status_code=201)
+def create_terminal(
+    session_id: str,
+    body: CreatePanelWindowRequest,
+    request: Request,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    state: WebAppState = request.app.state.web
+    store = session_store(state)
+    require_active_session(store, session_id)
+    owner = _panel_thread(store, session_id, thread_id)
+    source = _turn(store, session_id, body.source_turn_id, owner)
+    if not source.cwd:
+        raise HTTPException(status_code=409, detail="当前 Turn 没有可用 cwd。")
+    terminal_type = state.settings.runtime_config().get("terminal_type", "cmd")
+    try:
+        with state.conversation_cache.lock:
+            state.conversation_cache.touch(session_id, source.thread_id, [source.id])
+            terminal = state.terminal_manager.create(terminal_type, source.cwd, thread_id=source.thread_id)
+    except MessageQueueUnavailable as exc:
+        return error_response(exc, status_code=503, detail="message_queue_unavailable")
+    except (RuntimeError, ValueError) as exc:
+        return error_response(exc, status_code=409, detail=str(exc))
+    all_windows = store.list_right_panel_windows(session_id, include_deleted=True, owner_thread_id=owner)
+    number = sum(item.kind == "terminal" and item.terminal_type == terminal.terminal_type for item in all_windows) + 1
+    now = utc_now()
+    window = RightPanelWindow(
+        id=f"window_{uuid4().hex}",
+        session_id=session_id,
+        kind="terminal",
+        owner_thread_id=owner,
+        title=f"{TERMINAL_LABELS[terminal.terminal_type]} {number}",
+        position=len(all_windows),
+        created_at=now,
+        updated_at=now,
+        terminal_id=terminal.id,
+        terminal_type=terminal.terminal_type,
+        cwd=terminal.cwd,
+    )
+    try:
+        store.create_right_panel_window(window)
+        store.save_right_panel_state(session_id, collapsed=False, active_window_id=window.id, thread_id=owner)
+    except (RuntimeError, ValueError) as exc:
+        state.terminal_manager.close(terminal.id)
+        return error_response(exc, status_code=409, detail=str(exc))
+    return {"window": window.to_dict(), "terminal": terminal.payload()}
+
+
+@router.post("/{session_id}/files", status_code=201)
+def create_files_window(session_id: str, request: Request, thread_id: str | None = None) -> dict[str, object]:
+    store = session_store(request.app.state.web)
+    require_active_session(store, session_id)
+    owner = _panel_thread(store, session_id, thread_id)
+    existing = next(
+        (item for item in store.list_right_panel_windows(session_id, owner_thread_id=owner) if item.kind == "files"),
+        None,
+    )
+    if existing is not None:
+        store.save_right_panel_state(session_id, collapsed=False, active_window_id=existing.id, thread_id=owner)
+        return {"window": existing.to_dict()}
+    all_windows = store.list_right_panel_windows(session_id, include_deleted=True, owner_thread_id=owner)
+    now = utc_now()
+    window = RightPanelWindow(
+        id=f"window_{uuid4().hex}",
+        session_id=session_id,
+        kind="files",
+        owner_thread_id=owner,
+        title="文件",
+        position=len(all_windows),
+        created_at=now,
+        updated_at=now,
+    )
+    store.create_right_panel_window(window)
+    store.save_right_panel_state(session_id, collapsed=False, active_window_id=window.id, thread_id=owner)
+    return {"window": window.to_dict()}
+
+
+@router.patch("/{session_id}/windows/{window_id}")
+def rename_window(
+    session_id: str,
+    window_id: str,
+    body: RenamePanelWindowRequest,
+    request: Request,
+    thread_id: str | None = None,
+) -> dict[str, object]:
+    store = session_store(request.app.state.web)
+    require_active_session(store, session_id)
+    _window(store, session_id, window_id, _panel_thread(store, session_id, thread_id))
+    try:
+        return store.update_right_panel_window(session_id, window_id, title=body.title).to_dict()
+    except ValueError as exc:
+        return error_response(exc, status_code=422, detail=str(exc))
+
+
+@router.delete("/{session_id}/windows/{window_id}", status_code=204)
+def close_window(session_id: str, window_id: str, request: Request, thread_id: str | None = None) -> None:
+    state: WebAppState = request.app.state.web
+    store = session_store(state)
+    require_active_session(store, session_id)
+    owner = _panel_thread(store, session_id, thread_id)
+    window = _window(store, session_id, window_id, owner)
+    store.update_right_panel_window(session_id, window_id, deleted_at=utc_now())
+    if window.kind == "terminal" and window.terminal_id is not None:
+        state.terminal_manager.close(window.terminal_id)
+    elif window.kind == "side_chat" and window.thread_id is not None:
+        runtime_thread = store.get_runtime_thread(session_id, window.thread_id)
+        running_turn_id = runtime_thread.running_turn_id if runtime_thread is not None else None
+        if running_turn_id:
+            controller = getattr(state, "active_turn_cancellations", {}).get(running_turn_id)
+            request_pause = getattr(controller, "request_pause", None)
+            try:
+                if callable(request_pause):
+                    request_pause()
+                else:
+                    store.pause_turn(running_turn_id)
+            except (KeyError, RuntimeError, ValueError):
+                pass
+    remaining = store.list_right_panel_windows(session_id, owner_thread_id=owner)
+    current = store.get_right_panel_state(session_id, thread_id=owner)
+    if current.active_window_id == window_id:
+        store.save_right_panel_state(
+            session_id, active_window_id=remaining[0].id if remaining else None, thread_id=owner
+        )
+
+
+async def _terminal_output(websocket: WebSocket, state: WebAppState, terminal_id: str, after: int) -> None:
+    sequence = after
+    while True:
+        chunks = await asyncio.to_thread(state.terminal_manager.wait_after, terminal_id, sequence)
+        for chunk in chunks:
+            content = {"segments": chunk.segments} if chunk.segments else {"data": chunk.data}
+            await websocket.send_json({"type": "output", "sequence": chunk.sequence, **content})
+            sequence = chunk.sequence
+        terminal = state.terminal_manager.get(terminal_id)
+        if terminal is None:
+            return
+        if terminal.exit_code is not None:
+            await websocket.send_json({"type": "exit", "code": terminal.exit_code, "last_sequence": sequence})
+            return
+
+
+async def _terminal_input(
+    websocket: WebSocket,
+    state: WebAppState,
+    terminal_id: str,
+    *,
+    window_id: str | None = None,
+    session_id: str | None = None,
+    generation: int | None = None,
+) -> None:
+    while True:
+        payload = await websocket.receive_json()
+        if window_id and (
+            session_id is None
+            or generation is None
+            or not await state.operation_control.is_session_owner(window_id, session_id, generation)
+        ):
+            await websocket.close(code=1008)
+            return
+        if not isinstance(payload, dict):
+            await websocket.close(code=1003)
+            return
+        kind = payload.get("type")
+        try:
+            if kind == "input" and isinstance(payload.get("data"), str):
+                state.terminal_manager.write(terminal_id, payload["data"])
+            elif kind == "resize" and isinstance(payload.get("cols"), int) and isinstance(payload.get("rows"), int):
+                state.terminal_manager.resize(terminal_id, payload["cols"], payload["rows"])
+            else:
+                raise ValueError("Invalid terminal WebSocket message.")
+        except (KeyError, ValueError):
+            await websocket.close(code=1003)
+            return
+
+
+def _terminal_session_id(state: WebAppState, terminal_id: str) -> str | None:
+    store = session_store(state)
+    for summary in store.list_sessions(state="all"):
+        if any(window.terminal_id == terminal_id for window in store.list_right_panel_windows(summary.session_id)):
+            return summary.session_id
+    return None
+
+
+@router.websocket("/terminals/{terminal_id}/ws")
+async def terminal_websocket(terminal_id: str, websocket: WebSocket) -> None:
+    settings = LocalWebSettings.from_env()
+    if not browser_origin_allowed(websocket.headers.get("origin"), settings):
+        await websocket.close(code=1008)
+        return
+    state: WebAppState = websocket.app.state.web
+    window_id = websocket.query_params.get("window_id", "")
+    try:
+        generation = int(websocket.query_params.get("generation", "0"))
+    except ValueError:
+        generation = 0
+    session_id = _terminal_session_id(state, terminal_id)
+    writable = not window_id or bool(
+        session_id and await state.operation_control.is_session_owner(window_id, session_id, generation)
+    )
+    try:
+        terminal = state.terminal_manager.connect(terminal_id)
+    except KeyError:
+        await websocket.close(code=1008)
+        return
+    try:
+        try:
+            after = max(0, int(websocket.query_params.get("after_sequence", "0")))
+        except ValueError:
+            await websocket.close(code=1003)
+            return
+        await websocket.accept()
+        await websocket.send_json({"type": "ready", **terminal.payload()})
+        output = asyncio.create_task(_terminal_output(websocket, state, terminal_id, after))
+        input_task = (
+            asyncio.create_task(
+                _terminal_input(
+                    websocket,
+                    state,
+                    terminal_id,
+                    window_id=window_id or None,
+                    session_id=session_id,
+                    generation=generation,
+                )
+            )
+            if writable
+            else None
+        )
+        tasks = {output, input_task} if input_task is not None else {output}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        state.terminal_manager.disconnect(terminal_id)
+
+
+__all__ = ["router"]

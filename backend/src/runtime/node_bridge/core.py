@@ -1,0 +1,405 @@
+"""RuntimeEventNodeBridge construction, binding, and Turn startup."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from threading import RLock
+from typing import Any
+
+from backend.domain.input_message import InputMessage
+from backend.domain.runtime_state import (
+    NodeFrame,
+    NodeWriter,
+    RuntimeNodeStore,
+    RuntimeRootState,
+    RuntimeState,
+    RuntimeStateTree,
+    RuntimeStateValidationError,
+    TerminalErrorCategory,
+)
+
+from .audit import _TraceAuditMixin
+from .events import _EventProjectionMixin
+from .finalization import _FinalizationMixin
+from .items import _ItemProjectionMixin
+from .lifecycle import _LifecycleMixin
+
+
+class RuntimeEventNodeBridge(
+    _TraceAuditMixin, _EventProjectionMixin, _FinalizationMixin, _LifecycleMixin, _ItemProjectionMixin
+):
+    """Keep the canonical Turn synchronized with an in-process AgentRuntime."""
+
+    def __init__(
+        self,
+        store: RuntimeNodeStore,
+        *,
+        session_id: str,
+        message: InputMessage | None,
+        turn_id: str | None = None,
+        compaction_turn_id: str | None = None,
+        thread_id: str | None = None,
+        source_node_id: str | None = None,
+        adopt_existing: bool = False,
+        emit_adopted_snapshot: bool = True,
+        user: str = "",
+        provider: str = "unknown",
+        provider_name: str | None = None,
+        model: str = "unknown",
+        model_config: Mapping[str, Any] | None = None,
+        permission_mode: str = "read_only",
+        running_mode: str = "agent",
+        cwd: str = "",
+        project_cwd: str = "",
+        thinking_level: str = "medium",
+        delivery_id: str | None = None,
+        isolated_thread_context: bool = False,
+        emit: Callable[[NodeFrame], None],
+        persist_delta: Callable[[NodeFrame, str, str], None] | None = None,
+        flush_persistence: Callable[[], None] | None = None,
+    ) -> None:
+        self.store = store
+        self.session_id = session_id
+        self.thread_id = thread_id or session_id
+        self.turn_id = turn_id
+        self.compaction_turn_id = compaction_turn_id
+        self.input_message = message
+        self.prompt = message.text if message is not None else ""
+        self.source_node_id = source_node_id
+        self.adopt_existing = adopt_existing
+        self.emit_adopted_snapshot = emit_adopted_snapshot
+        self.user = user
+        self.provider = provider or "unknown"
+        self.provider_name = provider_name or self.provider
+        self.model = model or "unknown"
+        snapshot = dict(model_config or {})
+        snapshot.setdefault("current_model", self.model)
+        snapshot.setdefault("reasoning_effort", thinking_level or "medium")
+        snapshot.setdefault("thinking", "enable")
+        snapshot.setdefault("context_length", 128000)
+        snapshot.setdefault("output_length", 8192)
+        snapshot.setdefault("temperature", 0.0)
+        self.model_config = snapshot
+        self.permission_mode = permission_mode
+        self.running_mode = running_mode
+        self.cwd = cwd
+        self.project_cwd = project_cwd
+        self.delivery_id = delivery_id or ""
+        self.isolated_thread_context = isolated_thread_context
+        self.writer = NodeWriter(store, emit=emit, persist_delta=persist_delta, flush_persistence=flush_persistence)
+        self.parent: RuntimeState | RuntimeRootState | None = None
+        self.assistant: RuntimeState | None = None
+        self.last_node: RuntimeState | None = None
+        self.assistant_blocks: list[dict[str, Any]] = []
+        self.assistant_message_idx: int | None = None
+        self._assistant_after_report = False
+        self._stream_item_index: int | None = None
+        self._stream_item_type: str | None = None
+        self._stream_text = ""
+        self.protected_item_count = 0
+        self.run_id = ""
+        self.abort_category: TerminalErrorCategory | None = None
+        self.abort_code = ""
+        self.terminal_error: dict[str, Any] | None = None
+        self.persistence_failed = False
+        self.trace_persistence_failed = False
+        self.produced_item = False
+        self.started = False
+        self.closed = False
+        self.runtime: Any = None
+        self._runtime_config_lock = RLock()
+        self._pending_modes: list[str] = []
+        self._trace_mode_requests: list[dict[str, Any]] = []
+        self._trace_effective_mode: str | None = None
+        self._trace_request: dict[str, Any] = {}
+        self._trace_request_open = False
+        self._trace_tools: dict[str, dict[str, Any]] = {}
+        self._trace_compaction: dict[str, Any] = {}
+        self._model_request_active = False
+
+    def bind_runtime(self, runtime: Any) -> None:
+        self.runtime = runtime
+        runtime.state.provider_name = self.provider_name
+        runtime.state.provider = self.provider
+        runtime.state.model = str(self.model_config.get("current_model") or self.model)
+        runtime.state.model_snapshot = dict(self.model_config)
+        runtime.state.permission_mode = self.permission_mode
+        runtime.state.running_mode = self.running_mode
+        runtime.services.runtime_node_event = self.handle
+        runtime.services.runtime_node_context = self.model_context
+        runtime.services.persist_agent_report = self._persist_agent_report
+
+    def _persist_agent_report(self, delivery_id: str, reply_content: str) -> None:
+        self._finish_stream_item()
+        if self.assistant is None:
+            self.start()
+        if self.assistant is None:
+            raise RuntimeError("Report recipient has no active Turn.")
+        self.assistant = self.writer.append_report(self.assistant, delivery_id, reply_content)
+        self.last_node = self.assistant
+        message_idx = len(self.assistant.data[self.assistant.current_data_idx]) - 1
+        self._record_completed_item(message_idx, 0)
+        self._assistant_after_report = True
+
+    def model_context(self) -> list[RuntimeState]:
+        self.writer.flush()
+        current = self._current()
+        if current is None:
+            return []
+        path: list[RuntimeState | RuntimeRootState] = [current]
+        seen = {current.key}
+        node = current
+        while node.parent_id:
+            parent = self.store.get_node(node.parent_session_id, node.parent_id)
+            if parent is None:
+                raise RuntimeStateValidationError(f"Turn parent is missing: {node.parent_id}")
+            if parent.key in seen:
+                raise RuntimeStateValidationError("Turn parent chain contains a cycle.")
+            if self.isolated_thread_context and parent.thread_id != current.thread_id:
+                break
+            seen.add(parent.key)
+            path.append(parent)
+            if isinstance(parent, RuntimeRootState):
+                break
+            node = parent
+        if self.isolated_thread_context:
+            return [node.clone() for node in reversed(path) if isinstance(node, RuntimeState)]
+        return RuntimeStateTree(path).model_input(current)
+
+    def _current(self) -> RuntimeState | None:
+        target = self.assistant or self.last_node
+        if target is None:
+            return None
+        try:
+            return self.writer.current(target.session_id, target.id)
+        except KeyError:
+            return target.clone()
+
+    def _bind_existing_trace(self, node: RuntimeState) -> None:
+        """Resume Item auditing before any new runtime event is projected."""
+
+        if self.runtime is None:
+            return
+        load = getattr(self.store, "load_turn_trace", None)
+        if callable(load):
+            existing = load(node.session_id, node.id, node.current_data_idx)
+            self.runtime.services.turn_trace_initialized = existing is not None and bool(
+                existing.context.initialized_at
+            )
+
+    def _latest_parent(self) -> RuntimeState | RuntimeRootState:
+        nodes = [node for node in self.store.load_nodes(self.session_id) if node.thread_id == self.thread_id]
+        turns = [node for node in nodes if isinstance(node, RuntimeState)]
+        if turns:
+            parent_keys = {(node.parent_session_id, node.parent_id) for node in turns if node.parent_id}
+            leaves = [node for node in turns if node.key not in parent_keys]
+            return max(leaves or turns, key=lambda node: (node.timestamp, node.id))
+        if self.thread_id != self.session_id:
+            raise RuntimeStateValidationError("A fork Thread must begin with a copied Turn.")
+        return self.store.ensure_root_node(self.session_id)
+
+    def start(self) -> RuntimeState:
+        if self.started:
+            current = self._current()
+            if current is None:
+                raise RuntimeError("Turn bridge has no active Turn.")
+            return current
+        if self.source_node_id:
+            source = self.store.get_node(self.session_id, self.source_node_id)
+            if source is None:
+                raise ValueError("Unknown source Turn.")
+            if isinstance(source, RuntimeRootState):
+                raise ValueError("A root Turn is only an ancestry anchor.")
+            if source.session_id != self.session_id:
+                raise ValueError("A Turn cannot continue across Sessions.")
+            if self.adopt_existing or not self.prompt:
+                if source.status == "paused":
+                    resume = getattr(self.store, "resume_turn_node", None)
+                    if not callable(resume):
+                        raise RuntimeError("The Turn store does not support resume.")
+                    source = resume(source.id)
+                elif source.status != "running":
+                    raise ValueError("Only a paused or running Turn can resume in place.")
+                source = (
+                    self.writer.adopt(source)
+                    if self.adopt_existing and not self.emit_adopted_snapshot
+                    else self.writer.snapshot(source)
+                )
+                self.assistant = source
+                self.last_node = source
+                self.thread_id = source.thread_id
+                self.turn_id = source.id
+                selected = source.data[source.current_data_idx]
+                self.assistant_message_idx = len(selected) - 1 if selected[-1]["role"] == "assistant" else None
+                self.assistant_blocks = source.assistant_items if self.assistant_message_idx is not None else []
+                self._assistant_after_report = bool(
+                    self.assistant_blocks
+                    and self.assistant_blocks[0].get("type") == "subagent"
+                    and self.assistant_blocks[0].get("event") == "agent_report"
+                )
+                if self.assistant_blocks and self.assistant_blocks[0].get("type") == "compaction":
+                    self.protected_item_count = 1 + int(self.assistant_blocks[0].get("kept_item_count") or 0)
+                self._bind_existing_trace(source)
+                self.started = True
+                self._initialize_collaboration_mode()
+                return self.assistant
+            self.parent = source
+            if self.thread_id == self.session_id:
+                self.thread_id = source.thread_id
+        else:
+            self.parent = self._latest_parent()
+        user_item = (
+            self.input_message.to_item()
+            if self.input_message is not None
+            else {"type": "text", "text": "", "status": "success"}
+        )
+        node = RuntimeState.create(
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            id=self.turn_id,
+            parent=self.parent,
+            user_content=[user_item],
+            user=self.user,
+            provider_name=self.provider_name,
+            model=self.model_config,
+            permission_mode=self.permission_mode,
+            running_mode=self.running_mode,
+            cwd=self.cwd,
+            project_cwd=self.project_cwd,
+            data=None,
+        )
+        if self.delivery_id:
+            node.data[0][0]["delivery_id"] = self.delivery_id
+            node.__post_init__()
+        node = self.writer.create(node)
+        self.assistant = node
+        self.last_node = node
+        self.turn_id = node.id
+        self.assistant_message_idx = 1
+        self._bind_existing_trace(node)
+        self.started = True
+        self._initialize_collaboration_mode()
+        return self.assistant
+
+    def _ensure_assistant_message(self) -> None:
+        if self.assistant is None:
+            self.start()
+        assert self.assistant is not None
+        current = self.writer.view(self.assistant.session_id, self.assistant.id)
+        messages = current.data[current.current_data_idx]
+        if (
+            self.assistant_message_idx is not None
+            and 0 <= self.assistant_message_idx < len(messages)
+            and messages[self.assistant_message_idx].get("role") == "assistant"
+        ):
+            self.assistant = current
+            self.last_node = current
+            return
+        if messages[-1]["role"] != "assistant":
+            current = self.writer.append_message(
+                current,
+                {"role": "assistant", "content": []},
+                persist=True,
+            )
+            messages = current.data[current.current_data_idx]
+            self.assistant_blocks = []
+        self.assistant = current
+        self.last_node = current
+        self.assistant_message_idx = len(messages) - 1
+
+    def _start_assistant_after_report(self) -> None:
+        if not self._assistant_after_report:
+            return
+        if self.assistant is None:
+            self.start()
+        assert self.assistant is not None
+        current = self.writer.current(self.assistant.session_id, self.assistant.id)
+        self.assistant = self.writer.append_message(
+            current,
+            {"role": "assistant", "content": []},
+            persist=True,
+        )
+        self.last_node = self.assistant
+        self.assistant_message_idx = len(self.assistant.data[self.assistant.current_data_idx]) - 1
+        self.assistant_blocks = []
+        self._assistant_after_report = False
+
+    def _append_subagent_report(self, data: Mapping[str, Any]) -> None:
+        reply_content = str(data.get("reply_content") or "")
+        delivery_id = str(data.get("delivery_id") or "")
+        if not delivery_id:
+            raise ValueError("A subagent report requires delivery_id.")
+        self._finish_stream_item()
+        if self.assistant is None:
+            self.start()
+        assert self.assistant is not None
+        selected = self.assistant.data[self.assistant.current_data_idx]
+        if any(
+            item.get("type") == "subagent" and item.get("delivery_id") == delivery_id
+            for message in selected
+            for item in message.get("content", [])
+        ):
+            return
+        message = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "subagent",
+                    "event": "agent_report",
+                    "status": "success",
+                    "text": reply_content,
+                    "delivery_id": delivery_id,
+                }
+            ],
+        }
+        self.assistant = self.writer.append_message(self.assistant, message, persist=True)
+        self.last_node = self.assistant
+        message_idx = len(self.assistant.data[self.assistant.current_data_idx]) - 1
+        self._record_completed_item(message_idx, 0)
+        self._assistant_after_report = True
+
+    def _append_steering_message(self, data: Mapping[str, Any]) -> None:
+        content = str(data.get("content") or "").strip()
+        references = data.get("references")
+        if not content and not references:
+            return
+        self._finish_stream_item()
+        if self.assistant is None:
+            self.start()
+        assert self.assistant is not None
+        item: dict[str, Any] = {"type": "text", "text": content, "status": "success"}
+        if isinstance(references, list) and references:
+            item["references"] = self._json_value(references)
+        message: dict[str, Any] = {"role": "user", "content": [item]}
+        delivery_id = str(data.get("delivery_id") or "")
+        if delivery_id:
+            selected = self.assistant.data[self.assistant.current_data_idx]
+            if any(value.get("role") == "user" and value.get("delivery_id") == delivery_id for value in selected):
+                return
+            message["delivery_id"] = delivery_id
+        self._ensure_assistant_message()
+        self.assistant = self.writer.append_message(self.assistant, message, persist=True)
+        self.last_node = self.assistant
+        message_idx = len(self.assistant.data[self.assistant.current_data_idx]) - 1
+        self._record_completed_item(message_idx, 0)
+        self.assistant_blocks = []
+        self.assistant_message_idx = None
+
+    def start_for_compaction(self) -> RuntimeState | None:
+        if not self.started:
+            self.parent = (
+                self.store.get_node(self.session_id, self.source_node_id)
+                if self.source_node_id
+                else self._latest_parent()
+            )
+            if self.parent is None:
+                raise ValueError("Unknown source Turn.")
+            if isinstance(self.parent, RuntimeRootState):
+                raise ValueError("A root Turn is only an ancestry anchor.")
+            if self.parent.status != "success":
+                raise ValueError("Only a successful Turn can be compacted.")
+            self.thread_id = self.parent.thread_id
+            self.last_node = self.parent
+            self.assistant = None
+            self.started = True
+        return self.last_node

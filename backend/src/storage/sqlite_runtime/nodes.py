@@ -1,0 +1,702 @@
+"""Canonical Turn-node persistence and tree mutations."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
+from copy import deepcopy
+from dataclasses import dataclass
+from sqlite3 import Connection
+
+from backend.domain.runtime_state import (
+    NodeFrame,
+    RuntimeNode,
+    RuntimeRootState,
+    RuntimeStateTree,
+    RuntimeStateValidationError,
+    message_payload,
+    new_node_id,
+    new_thread_id,
+    runtime_node_from_dict,
+    utc_iso,
+)
+from backend.domain.runtime_state import RuntimeState as TreeRuntimeState
+from backend.domain.state import new_run_id, utc_now
+
+
+@dataclass
+class TurnPage:
+    turns: list[TreeRuntimeState]
+    next_cursor: str | None
+    current_turn_id: str | None
+
+
+def _require_runtime_turn(node: RuntimeNode | None, turn_id: str) -> TreeRuntimeState:
+    if node is None:
+        raise KeyError(turn_id)
+    if isinstance(node, RuntimeRootState):
+        raise ValueError("A root Turn is only an ancestry anchor.")
+    return node
+
+
+def _successful_snapshot_messages(source: TreeRuntimeState) -> list[dict[str, object]]:
+    messages = deepcopy(source.data[source.current_data_idx])
+    tool_items: dict[str, list[tuple[int, int, dict[str, object]]]] = {}
+    for message_index, message in enumerate(messages):
+        for item_index, item in enumerate(message["content"]):
+            if item.get("type") not in {"tool_call", "tool_result"}:
+                continue
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            tool_items.setdefault(call_id, []).append((message_index, item_index, item))
+    complete_items: set[tuple[int, int]] = set()
+    for entries in tool_items.values():
+        if len(entries) != 2:
+            continue
+        (call_message, call_index, call), (result_message, result_index, result) = entries
+        if call.get("type") != "tool_call" or result.get("type") != "tool_result":
+            continue
+        if call.get("status") != "success" or result.get("status") != "success":
+            continue
+        if "tool" in result and result.get("tool") != call.get("name"):
+            continue
+        complete_items.update({(call_message, call_index), (result_message, result_index)})
+    for message_index, message in enumerate(messages):
+        filtered: list[dict[str, object]] = []
+        for item_index, item in enumerate(message["content"]):
+            if item.get("status") != "success":
+                continue
+            if (
+                item.get("type") in {"tool_call", "tool_result"}
+                and (
+                    message_index,
+                    item_index,
+                )
+                not in complete_items
+            ):
+                continue
+            filtered.append(item)
+        message["content"] = filtered
+    if messages[-1]["role"] != "assistant":
+        messages.append(message_payload("assistant"))
+    return messages
+
+
+class SQLiteNodeMixin:
+    def ensure_root_node(self, session_id: str, *, id: str | None = None) -> RuntimeRootState:
+        """Persist and return the sole synthetic root for an otherwise empty Session."""
+
+        with self._connection(session_id, write=True) as connection:
+            self._assert_writable(connection)
+            self._session_document(connection, session_id)
+            nodes = self._objects(connection, session_id, "runtime_node")
+            roots = [node for node in nodes if isinstance(node, RuntimeRootState)]
+            if len(roots) > 1:
+                raise RuntimeStateValidationError("A Session may contain only one root Turn.")
+            if roots:
+                return roots[0]
+            if nodes:
+                raise RuntimeStateValidationError("A Session with Turns must already contain its root Turn.")
+            root = RuntimeRootState.create(session_id, id=id)
+            timestamp = utc_iso()
+            self._put_json_object(connection, session_id, "runtime_node", root.id, root.to_dict(), timestamp)
+            self._touch_session(connection, session_id, timestamp)
+            return root
+
+    def create_node(self, node: TreeRuntimeState) -> None:
+        self._create_node(node, None)
+
+    def create_node_with_frame(self, node: TreeRuntimeState, frame: NodeFrame) -> None:
+        self._create_node(node, frame)
+
+    def _create_node(self, node: TreeRuntimeState, frame: NodeFrame | None) -> None:
+        if node.status != "running":
+            raise ValueError("A Turn must be created with status='running'.")
+        if not node.parent_id:
+            raise ValueError("A non-root Turn must have a parent Turn.")
+        parent = self.get_node(node.parent_session_id, node.parent_id)
+        if parent is None:
+            raise ValueError("A runtime node parent must be present in the store.")
+        if node.parent_session_id != node.session_id:
+            raise ValueError("A Turn cannot continue across Sessions.")
+        if node.parent_thread_id != parent.thread_id:
+            raise ValueError("parent_thread_id does not match the parent Turn.")
+        with self._connection(node.session_id, write=True) as connection:
+            self._assert_writable(connection)
+            self._session_document(connection, node.session_id)
+            self._ensure_runtime_thread_record(
+                connection,
+                session_id=node.session_id,
+                thread_id=node.thread_id,
+                origin_kind="main" if node.thread_id == node.session_id else "fork",
+                timestamp=node.timestamp,
+            )
+            if node.thread_id == node.session_id or node.thread_id != parent.thread_id:
+                self._ensure_agent_tree_root_record(
+                    connection,
+                    session_id=node.session_id,
+                    thread_id=node.thread_id,
+                    timestamp=node.timestamp,
+                )
+            self._claim_thread_turn(
+                connection,
+                session_id=node.session_id,
+                thread_id=node.thread_id,
+                turn_id=node.id,
+                timestamp=node.timestamp,
+            )
+            self._put_json_object(connection, node.session_id, "runtime_node", node.id, node.to_dict(), node.timestamp)
+            if frame is not None:
+                self._advance_frame_sequence(connection, frame)
+            self._touch_session(connection, node.session_id, node.timestamp)
+
+    def update_node(self, node: TreeRuntimeState) -> None:
+        self._update_node(node, None)
+
+    def update_running_turn_config(
+        self, session_id: str, turn_id: str, changes: Mapping[str, object]
+    ) -> TreeRuntimeState:
+        if set(changes) - {"provider_name", "model", "permission_mode", "running_mode"}:
+            raise RuntimeStateValidationError("Unsupported Turn configuration field.")
+        with self._connection(session_id, write=True) as connection:
+            self._assert_writable(connection)
+            payload = self._json_object(connection, session_id, "runtime_node", turn_id)
+            if payload is None:
+                raise KeyError(turn_id)
+            if payload.get("status") != "running":
+                raise ValueError("Only a running Turn can change configuration.")
+            # Read and merge under the write transaction so startup deltas cannot be lost.
+            payload.update(deepcopy(dict(changes)))
+            node = TreeRuntimeState.from_dict(payload)
+            self._put_json_object(connection, session_id, "runtime_node", turn_id, node.to_dict(), node.timestamp)
+            self._touch_session(connection, session_id, utc_now())
+            return node
+
+    def update_node_with_frame(self, node: TreeRuntimeState, frame: NodeFrame) -> None:
+        if frame.type == "turn.delta":
+            self.append_runtime_delta(frame, thread_id=node.thread_id, status=node.status)
+        else:
+            self._update_node(node, frame)
+
+    def _update_node(self, node: TreeRuntimeState, frame: NodeFrame | None) -> None:
+        activity_at = utc_now()
+        with self._connection(node.session_id, write=True) as connection:
+            self._assert_writable(connection)
+            existing = self._json_object(connection, node.session_id, "runtime_node", node.id)
+            if existing is None:
+                raise KeyError(node.id)
+            self._put_json_object(connection, node.session_id, "runtime_node", node.id, node.to_dict(), node.timestamp)
+            if frame is not None:
+                self._advance_frame_sequence(connection, frame)
+            self._set_thread_head(
+                connection,
+                session_id=node.session_id,
+                thread_id=node.thread_id,
+                turn_id=node.id,
+                timestamp=activity_at,
+                clear_running=node.status in {"success", "paused", "failed"},
+            )
+            self._touch_session(connection, node.session_id, activity_at)
+
+    def create_finalized_nodes(self, nodes: list[TreeRuntimeState] | tuple[TreeRuntimeState, ...]) -> None:
+        """Atomically append an ordered batch of terminal canonical nodes."""
+
+        if not nodes:
+            return
+        session_id = nodes[0].session_id
+        if any(node.session_id != session_id for node in nodes):
+            raise ValueError("A finalized node batch must belong to one session.")
+        with self._connection(session_id, write=True) as connection:
+            self._assert_writable(connection)
+            self._session_document(connection, session_id)
+            existing = self._objects(connection, session_id, "runtime_node")
+            by_key = {(node.session_id, node.id): node for node in existing}
+            staged = dict(by_key)
+            for node in nodes:
+                if node.status not in {"success", "paused", "failed"}:
+                    raise ValueError("A finalized node batch must contain terminal nodes.")
+                if node.key in staged:
+                    raise ValueError(f"Runtime node already exists: {node.session_id}/{node.id}")
+                if not node.parent_id:
+                    raise ValueError("A non-root Turn must have a parent Turn.")
+                parent = staged.get((node.parent_session_id, node.parent_id))
+                if parent is None:
+                    raise ValueError("A finalized node parent must be present in the store.")
+                if node.parent_session_id != session_id:
+                    raise ValueError("A Turn cannot continue across Sessions.")
+                if node.parent_thread_id != parent.thread_id:
+                    raise ValueError("parent_thread_id does not match the parent Turn.")
+                staged[node.key] = node
+            timestamp = nodes[-1].timestamp
+            for node in nodes:
+                self._ensure_runtime_thread_record(
+                    connection,
+                    session_id=node.session_id,
+                    thread_id=node.thread_id,
+                    origin_kind="main" if node.thread_id == node.session_id else "fork",
+                    timestamp=node.timestamp,
+                )
+                if node.thread_id == node.session_id or node.parent_thread_id != node.thread_id:
+                    self._ensure_agent_tree_root_record(
+                        connection,
+                        session_id=node.session_id,
+                        thread_id=node.thread_id,
+                        timestamp=node.timestamp,
+                    )
+                self._put_json_object(connection, session_id, "runtime_node", node.id, node.to_dict(), node.timestamp)
+                self._set_thread_head(
+                    connection,
+                    session_id=node.session_id,
+                    thread_id=node.thread_id,
+                    turn_id=node.id,
+                    timestamp=node.timestamp,
+                    clear_running=True,
+                )
+            self._touch_session(connection, session_id, timestamp)
+
+    def get_node(self, session_id: str, node_id: str) -> RuntimeNode | None:
+        if not self.paths.session_db(session_id).exists():
+            return None
+        with self._connection(session_id) as connection:
+            value = self._json_object(connection, session_id, "runtime_node", node_id)
+        return runtime_node_from_dict(value) if value is not None else None
+
+    def find_node(self, node_id: str) -> RuntimeNode | None:
+        matches: list[RuntimeNode] = []
+        for session_id in self.session_ids():
+            node = self.get_node(session_id, node_id)
+            if node is not None:
+                matches.append(node)
+        if len(matches) > 1:
+            raise ValueError("Turn id is not globally unique.")
+        return matches[0] if matches else None
+
+    def list_children(self, parent_session_id: str, parent_id: str) -> list[TreeRuntimeState]:
+        result: list[TreeRuntimeState] = []
+        for summary in self.list_sessions(state="all"):
+            with self._connection(summary.session_id) as connection:
+                for value in self._objects(connection, summary.session_id, "runtime_node"):
+                    if isinstance(value, RuntimeRootState):
+                        continue
+                    if value.parent_session_id == parent_session_id and value.parent_id == parent_id:
+                        result.append(value)
+        return sorted(result, key=lambda item: (item.timestamp, item.id))
+
+    def load_running_nodes(self, session_id: str):
+        with self._connection(session_id) as connection:
+            ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT running_turn_id FROM runtime_threads WHERE session_id=? AND running_turn_id IS NOT NULL",
+                    (session_id,),
+                )
+            ]
+        return [node for node_id in ids if (node := self.get_node(session_id, node_id)) is not None]
+
+    def load_turn_page(self, session_id: str, thread_id: str, *, before: str | None = None, limit: int = 5) -> TurnPage:
+        # Keep the head and its nodes in the same read transaction.
+        with ExitStack() as stack:
+            connections: dict[str, Connection] = {}
+
+            def connection_for(sid: str) -> Connection:
+                if sid not in connections:
+                    connections[sid] = stack.enter_context(self._connection(sid))
+                return connections[sid]
+
+            def read_node(sid: str, turn_id: str) -> RuntimeNode | None:
+                value = self._json_object(connection_for(sid), sid, "runtime_node", turn_id)
+                return runtime_node_from_dict(value) if value is not None else None
+
+            connection = connection_for(session_id)
+            row = connection.execute(
+                "SELECT * FROM runtime_threads WHERE session_id=? AND thread_id=?", (session_id, thread_id)
+            ).fetchone()
+            thread = self._runtime_thread(row)
+            if thread is None:
+                raise KeyError("Conversation not found.")
+            return self._read_turn_page(
+                session_id, thread_id, thread.current_turn_id, read_node, connection, before, limit
+            )
+
+    def _read_turn_page(
+        self,
+        session_id: str,
+        thread_id: str,
+        head: str | None,
+        read_node: Callable[[str, str], RuntimeNode | None],
+        connection: Connection,
+        before: str | None,
+        limit: int,
+    ) -> TurnPage:
+        import json
+
+        current_session, current_id = session_id, head
+        if before:
+            try:
+                cursor = json.loads(before)
+                if not isinstance(cursor, dict) or any(
+                    not isinstance(cursor.get(key), str) or not cursor[key]
+                    for key in ("thread", "head", "session", "turn")
+                ):
+                    raise ValueError("Invalid history cursor.")
+                if cursor["thread"] != thread_id:
+                    raise ValueError("Conversation history changed; reload the latest page.")
+                cursor_head = read_node(session_id, cursor["head"])
+                if not isinstance(cursor_head, TreeRuntimeState) or (
+                    "version" in cursor and cursor_head.current_data_idx != cursor["version"]
+                ):
+                    raise ValueError("Conversation history changed; reload the latest page.")
+                if head != cursor["head"]:
+                    continuation = connection.execute(
+                        "WITH RECURSIVE ancestry(id) AS (VALUES (?) UNION "
+                        "SELECT json_extract(n.payload_json, '$.parent_id') FROM ancestry a "
+                        "JOIN json_objects n ON n.object_id=a.id AND n.namespace='runtime_node' AND n.session_id=? "
+                        "WHERE json_extract(n.payload_json, '$.parent_session_id')=?) "
+                        "SELECT 1 FROM ancestry WHERE id=? LIMIT 1",
+                        (head, session_id, session_id, cursor["head"]),
+                    ).fetchone()
+                    if continuation is None:
+                        raise ValueError("Conversation history changed; reload the latest page.")
+                current_session, current_id = cursor["session"], cursor["turn"]
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Invalid history cursor.") from exc
+        page: list[TreeRuntimeState] = []
+        seen: set[tuple[str, str]] = set()
+        while current_id and len(page) < limit + 1:
+            key = (current_session, current_id)
+            if key in seen:
+                raise ValueError("Conversation history contains a cycle.")
+            seen.add(key)
+            node = read_node(current_session, current_id)
+            if node is None:
+                raise ValueError(f"Conversation parent Turn is missing: {current_id}")
+            if isinstance(node, RuntimeRootState):
+                break
+            page.append(node)
+            current_session, current_id = node.parent_session_id, node.parent_id
+        more = len(page) > limit
+        cursor = None
+        if more:
+            following = page[limit]
+            head_node = read_node(session_id, head) if head else None
+            cursor = json.dumps(
+                {
+                    "thread": thread_id,
+                    "head": head,
+                    "version": head_node.current_data_idx if head_node else 0,
+                    "session": following.session_id,
+                    "turn": following.id,
+                }
+            )
+        return TurnPage(list(reversed(page[:limit])), cursor, head)
+
+    def load_nodes(self, session_id: str) -> list[RuntimeNode]:
+        if not self.paths.session_db(session_id).exists():
+            return []
+        with self._connection(session_id) as connection:
+            nodes = self._objects(connection, session_id, "runtime_node")
+        return sorted(
+            nodes,
+            key=lambda item: (0, "", item.id) if isinstance(item, RuntimeRootState) else (1, item.timestamp, item.id),
+        )
+
+    def finalize_node(self, node: TreeRuntimeState) -> None:
+        activity_at = utc_now()
+        with self._connection(node.session_id, write=True) as connection:
+            self._assert_writable(connection)
+            existing = self._json_object(connection, node.session_id, "runtime_node", node.id)
+            if existing is None:
+                raise ValueError(f"Unknown runtime node: {node.session_id}/{node.id}")
+            if str(existing.get("status")) != "running":
+                raise ValueError("Sealed runtime nodes are read-only.")
+            if node.status not in {"success", "paused", "failed"}:
+                raise ValueError("A Turn can only be finalized as success, paused, or failed.")
+            self._put_json_object(connection, node.session_id, "runtime_node", node.id, node.to_dict(), node.timestamp)
+            self._set_thread_head(
+                connection,
+                session_id=node.session_id,
+                thread_id=node.thread_id,
+                turn_id=node.id,
+                timestamp=activity_at,
+                clear_running=True,
+            )
+            self._touch_session(connection, node.session_id, activity_at)
+
+    def append_turn_version(
+        self,
+        turn_id: str,
+        user_item: Mapping[str, object],
+        *,
+        delivery_id: str | None = None,
+    ) -> TreeRuntimeState:
+        """Atomically rewind one Turn by appending a new selected version."""
+
+        node = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        if node.status == "running":
+            raise ValueError("A running Turn cannot be rewound.")
+        user = message_payload("user", [dict(user_item)], delivery_id=delivery_id)
+        assistant = message_payload("assistant", [])
+        with self._connection(node.session_id, write=True) as connection:
+            self._assert_writable(connection)
+            current = self._json_object(connection, node.session_id, "runtime_node", node.id)
+            if current is None:
+                raise KeyError(turn_id)
+            stored = TreeRuntimeState.from_dict(current)
+            self._claim_thread_turn(
+                connection,
+                session_id=stored.session_id,
+                thread_id=stored.thread_id,
+                turn_id=stored.id,
+                timestamp=utc_iso(),
+            )
+            stored.data.append([user, assistant])
+            stored.current_data_idx = len(stored.data) - 1
+            stored.status = "running"
+            stored.timestamp = utc_iso()
+            stored = TreeRuntimeState.from_dict(stored.to_dict())
+            self._put_json_object(
+                connection, stored.session_id, "runtime_node", stored.id, stored.to_dict(), stored.timestamp
+            )
+            self._touch_session(connection, stored.session_id, stored.timestamp)
+        return stored
+
+    def set_turn_current_data(self, turn_id: str, current_data_idx: int) -> TreeRuntimeState:
+        node = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        if isinstance(current_data_idx, bool) or not isinstance(current_data_idx, int):
+            raise RuntimeStateValidationError("current_data_idx must be an integer.")
+        if not 0 <= current_data_idx < len(node.data):
+            raise RuntimeStateValidationError("current_data_idx is out of range.")
+        node.current_data_idx = current_data_idx
+        node = TreeRuntimeState.from_dict(node.to_dict())
+        self.update_node(node)
+        return node
+
+    def select_turn_version(self, session_id: str, turn_id: str, index: int) -> dict:
+        if not self.paths.session_db(session_id).is_file():
+            raise KeyError(turn_id)
+        with self._connection(session_id, write=True, refresh_index=False, notify=False) as connection:
+            row = connection.execute(
+                "SELECT json_extract(payload_json, '$.status'), json_extract(payload_json, '$.thread_id'), "
+                "json_array_length(payload_json, '$.data') FROM json_objects "
+                "WHERE session_id=? AND namespace='runtime_node' AND object_id=?",
+                (session_id, turn_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(turn_id)
+            if row[0] is None:
+                raise ValueError("根 Turn 仅用于记录对话起点。")
+            if row[0] == "running":
+                raise RuntimeStateValidationError("Cannot select a version while the Turn is running.")
+            if not 0 <= index < row[2]:
+                raise RuntimeStateValidationError("current_data_idx is out of range.")
+            record = self._json_object(connection, session_id, "version_selection", turn_id) or {"revision": 0}
+            result = {
+                "session_id": session_id,
+                "thread_id": row[1],
+                "id": turn_id,
+                "current_data_idx": index,
+                "revision": record["revision"] + 1,
+            }
+            connection.execute(
+                "UPDATE json_objects SET payload_json=json_set(payload_json, '$.current_data_idx', ?) "
+                "WHERE session_id=? AND namespace='runtime_node' AND object_id=?",
+                (index, session_id, turn_id),
+            )
+            self._put_json_object(connection, session_id, "version_selection", turn_id, result, utc_now())
+        return result
+
+    def pause_turn(self, turn_id: str, message: str = "Paused by user.") -> TreeRuntimeState:
+        node = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        if node.status != "running":
+            raise ValueError("Only a running Turn can be paused.")
+        del message
+        for version in node.data:
+            for turn_message in version:
+                for item in turn_message["content"]:
+                    if item.get("status") == "running":
+                        item["status"] = "failed"
+        node.status = "paused"
+        node = TreeRuntimeState.from_dict(node.to_dict())
+        self.finalize_node(node)
+        return node
+
+    def resume_turn_node(self, turn_id: str) -> TreeRuntimeState:
+        """Re-open a paused Turn in place and continue its selected version."""
+
+        node = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        if node.status != "paused":
+            raise ValueError("Only a paused Turn can be resumed.")
+        with self._connection(node.session_id, write=True) as connection:
+            self._assert_writable(connection)
+            self._claim_thread_turn(
+                connection,
+                session_id=node.session_id,
+                thread_id=node.thread_id,
+                turn_id=node.id,
+                timestamp=utc_iso(),
+            )
+            content = next(
+                message["content"]
+                for message in reversed(node.data[node.current_data_idx])
+                if message.get("role") == "assistant"
+            )
+            if content and content[-1].get("type") == "error" and bool(content[-1].get("retryable")):
+                content.pop()
+            node.status = "running"
+            node = TreeRuntimeState.from_dict(node.to_dict())
+            self._put_json_object(connection, node.session_id, "runtime_node", node.id, node.to_dict(), utc_iso())
+            self._touch_session(connection, node.session_id, utc_iso())
+        return node
+
+    def complete_paused_turn(self, turn_id: str) -> TreeRuntimeState:
+        """Seal a paused Turn as success without creating another Turn."""
+
+        node = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        if node.status != "paused":
+            raise ValueError("Only a paused Turn can be marked successful.")
+        content = node.data[node.current_data_idx][-1]["content"]
+        if content and content[-1].get("type") == "error" and bool(content[-1].get("retryable")):
+            content.pop()
+        node.status = "success"
+        node.timestamp = utc_iso()
+        node = TreeRuntimeState.from_dict(node.to_dict())
+        with self._connection(node.session_id, write=True) as connection:
+            self._assert_writable(connection)
+            current = self._json_object(connection, node.session_id, "runtime_node", node.id)
+            if current is None or str(current.get("status")) != "paused":
+                raise ValueError("The paused Turn changed before it could be marked successful.")
+            self._put_json_object(connection, node.session_id, "runtime_node", node.id, node.to_dict(), node.timestamp)
+            self._set_thread_head(
+                connection,
+                session_id=node.session_id,
+                thread_id=node.thread_id,
+                turn_id=node.id,
+                timestamp=node.timestamp,
+                clear_running=True,
+            )
+            self._touch_session(connection, node.session_id, node.timestamp)
+        return node
+
+    def settle_indeterminate_tool_calls(self, turn_id: str) -> TreeRuntimeState:
+        """Seal running tool calls whose side effects cannot be determined after process loss."""
+
+        node = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        data_idx = node.current_data_idx
+        messages = node.data[data_idx]
+        terminal_results = {
+            str(item.get("call_id"))
+            for message in messages
+            for item in message.get("content", [])
+            if item.get("type") == "tool_result" and item.get("status") in {"success", "failed"} and item.get("call_id")
+        }
+        uncertain: list[tuple[str, str]] = []
+        for message in messages:
+            for item in message.get("content", []):
+                if item.get("type") != "tool_call" or item.get("status") != "running":
+                    continue
+                call_id = str(item.get("call_id") or "")
+                if not call_id or call_id in terminal_results:
+                    continue
+                item["status"] = "failed"
+                item["replay_safe"] = False
+                uncertain.append((call_id, str(item.get("name") or "unknown")))
+        if not uncertain:
+            return node
+        if messages[-1]["role"] != "assistant":
+            messages.append({"role": "assistant", "content": []})
+        for call_id, tool in uncertain:
+            messages[-1]["content"].append(
+                {
+                    "type": "tool_result",
+                    "call_id": call_id,
+                    "tool": tool,
+                    "content": (
+                        "Outcome is indeterminate because the process stopped after the tool call began. "
+                        "This call will not be replayed automatically."
+                    ),
+                    "status": "failed",
+                    "replay_safe": False,
+                    "retryable": False,
+                    "failure_code": "indeterminate",
+                }
+            )
+        node = TreeRuntimeState.from_dict(node.to_dict())
+        self.update_node(node)
+        return node
+
+    def fork_turn_node(
+        self,
+        turn_id: str,
+        *,
+        new_turn_id: str | None = None,
+        thread_id: str | None = None,
+        session_id: str | None = None,
+    ) -> TreeRuntimeState:
+        source = _require_runtime_turn(
+            self.get_node(session_id, turn_id) if session_id else self.find_node(turn_id), turn_id
+        )
+        if source.status == "running":
+            raise ValueError("A running Turn cannot be forked.")
+        parent = self.get_node(source.parent_session_id, source.parent_id)
+        if parent is None:
+            raise ValueError("Turn parent is missing.")
+        forked = RuntimeStateTree([parent]).fork(
+            source, id=new_turn_id or new_node_id(), thread_id=thread_id or new_thread_id()
+        )
+        runtime = (
+            self.load_runtime(source.session_id, thread_id=source.thread_id) if source.status == "paused" else None
+        )
+        if runtime is not None:
+            run = runtime.current_run
+            if run is None or run.turn_id != source.id or run.thread_id != source.thread_id:
+                raise ValueError("The paused Turn does not match its saved runtime.")
+            runtime.thread_id = forked.thread_id
+            run.thread_id = forked.thread_id
+            run.turn_id = forked.id
+            run.run_id = new_run_id()
+        self.create_finalized_nodes([forked])
+        if runtime is not None:
+            self.save_runtime(runtime)
+        return forked
+
+    def build_side_chat_anchor(
+        self,
+        turn_id: str,
+        *,
+        new_turn_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> TreeRuntimeState:
+        """Build a terminal hidden fork snapshot without interrupting a running source Turn."""
+
+        source = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        anchor = RuntimeStateTree(self.load_nodes(source.session_id)).fork(
+            source,
+            id=new_turn_id or new_node_id(),
+            thread_id=thread_id or new_thread_id(),
+        )
+        anchor.data = [_successful_snapshot_messages(source)]
+        anchor.current_data_idx = 0
+        anchor.status = "paused" if source.status == "running" else source.status
+        anchor.timestamp = utc_iso()
+        return TreeRuntimeState.from_dict(anchor.to_dict())
+
+    def create_compact_turn(
+        self,
+        turn_id: str,
+        summary: str,
+        *,
+        new_turn_id: str | None = None,
+        todo_snapshot: dict[str, object] | None = None,
+    ) -> TreeRuntimeState:
+        source = _require_runtime_turn(self.find_node(turn_id), turn_id)
+        if source.status != "success":
+            raise ValueError("Only a successful Turn can be compacted.")
+        compacted = RuntimeStateTree(self.load_nodes(source.session_id)).compact(
+            source,
+            summary,
+            id=new_turn_id or new_node_id(),
+            todo_snapshot=todo_snapshot,
+        )
+        self.create_node(compacted)
+        return compacted

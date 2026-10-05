@@ -1,0 +1,54 @@
+"""Todo-aware finalization policy for Agent Turns."""
+
+from __future__ import annotations
+
+from backend.domain import UserMessage
+
+from ..core.context import AgentRuntime
+
+TODO_FINALIZATION_INSTRUCTION = (
+    "The current Turn still has unfinished Todo items. This is the single finalization pass: update the Todo list "
+    "to reflect work actually completed, then give the final answer. Do not mark unfinished work as completed."
+)
+
+
+def refresh_todo_finalization_context(runtime: AgentRuntime) -> None:
+    """Restore the private correction instruction across loops and resumes."""
+
+    store = runtime.services.todo_store
+    turn_id = runtime.run.turn_id
+    if store is None or not turn_id:
+        runtime.services.context_suffix_messages = []
+        return
+    snapshot = store.snapshot(runtime.state.session_id, turn_id)
+    if snapshot.unfinished and store.finalization_claimed(runtime.state.session_id, turn_id):
+        runtime.services.context_suffix_messages = [UserMessage(content=TODO_FINALIZATION_INSTRUCTION)]
+    else:
+        runtime.services.context_suffix_messages = []
+
+
+def check_todo_finalization(runtime: AgentRuntime) -> bool:
+    """Return true when one extra model pass must run before completion."""
+
+    store = runtime.services.todo_store
+    turn_id = runtime.run.turn_id
+    if store is None or not turn_id:
+        return False
+    session_id = runtime.state.session_id
+    snapshot = store.snapshot(session_id, turn_id)
+    if not snapshot.unfinished:
+        runtime.services.context_suffix_messages = []
+        return False
+    if store.claim_finalization(session_id, turn_id):
+        runtime.services.context_suffix_messages = [UserMessage(content=TODO_FINALIZATION_INSTRUCTION)]
+        return True
+
+    runtime.services.context_suffix_messages = []
+    return False
+
+
+__all__ = [
+    "TODO_FINALIZATION_INSTRUCTION",
+    "check_todo_finalization",
+    "refresh_todo_finalization_context",
+]

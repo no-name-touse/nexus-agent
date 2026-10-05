@@ -1,0 +1,409 @@
+"""Application service for one persistent AgentRuntime conversation."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+from backend.domain import (
+    AssistantMessage,
+    MessageQueueUnavailable,
+    ResumePreview,
+    RunMode,
+    RunProvenance,
+    RunState,
+    RunTrigger,
+    Session,
+    SkillSnapshot,
+    UserMessage,
+    new_run_id,
+    new_session_id,
+    safe_error_message,
+)
+from backend.domain.input_message import InputMessage
+
+from ..core.context import text_messages
+from ..core.contracts import CancellationHandler, EventHandler, InterruptHandler, SteeringHandler
+from ..core.events import RuntimeEvent
+from ..execution import RuntimeRunner
+from ..node_bridge import RuntimeEventNodeBridge
+from .bridge_support import ConversationNodeBridgeMixin
+from .ports import SessionStore
+from .recovery.resuming import prepare_resume
+from .recovery.resuming import resume_session as resume_conversation
+from .session_control import ConversationSessionController
+
+
+class ConversationService(ConversationNodeBridgeMixin, ConversationSessionController):
+    def __init__(
+        self,
+        runner: RuntimeRunner,
+        session_store: SessionStore | None = None,
+        session_id: str | None = None,
+        default_timezone: str = "Asia/Shanghai",
+        session_provisioner: Callable[[SessionStore, str, Session], Session | None] | None = None,
+        session_provisioner_cleanup: Callable[[str], None] | None = None,
+        *,
+        thread_id: str | None = None,
+    ) -> None:
+        super().__init__(runner, session_store, session_id, default_timezone=default_timezone, thread_id=thread_id)
+        self._session_provisioner = session_provisioner
+        self._session_provisioner_cleanup = session_provisioner_cleanup
+        # Web streaming installs its bridge before invoking this service so it
+        # can expose the active leaf to PATCH /runtime-config.  Embedding
+        # callers leave this unset; ``_run_single_turn`` then owns a
+        # bridge and projects the same canonical node lifecycle internally.
+        self.runtime_node_bridge: RuntimeEventNodeBridge | None = None
+        self._node_bridge_events_external = False
+
+    def run_task(
+        self,
+        task: str,
+        *,
+        mode: RunMode,
+        on_event: EventHandler | None = None,
+        interrupt: InterruptHandler | None = None,
+        steering: SteeringHandler | None = None,
+        cancel_requested: CancellationHandler | None = None,
+        suspend_requested: CancellationHandler | None = None,
+        trigger: RunTrigger = "embedding",
+        request_parameters: Mapping[str, Any] | None = None,
+        references: Sequence[Mapping[str, str]] = (),
+        delivery_id: str | None = None,
+        on_started: Callable[[], None] | None = None,
+    ) -> RunState:
+        """Normalize input at the public embedding boundary."""
+        return self.run_message(
+            InputMessage.from_input(task, references),
+            mode=mode,
+            on_event=on_event,
+            interrupt=interrupt,
+            steering=steering,
+            cancel_requested=cancel_requested,
+            suspend_requested=suspend_requested,
+            trigger=trigger,
+            request_parameters=request_parameters,
+            delivery_id=delivery_id,
+            on_started=on_started,
+        )
+
+    def run_message(
+        self,
+        message: InputMessage,
+        *,
+        mode: RunMode,
+        on_event: EventHandler | None = None,
+        interrupt: InterruptHandler | None = None,
+        steering: SteeringHandler | None = None,
+        cancel_requested: CancellationHandler | None = None,
+        suspend_requested: CancellationHandler | None = None,
+        trigger: RunTrigger = "embedding",
+        request_parameters: Mapping[str, Any] | None = None,
+        delivery_id: str | None = None,
+        on_started: Callable[[], None] | None = None,
+    ) -> RunState:
+        state = self._run_single_turn(
+            message,
+            mode=mode,
+            on_event=on_event,
+            interrupt=interrupt,
+            steering=steering,
+            cancel_requested=cancel_requested,
+            suspend_requested=suspend_requested,
+            trigger=trigger,
+            request_parameters=request_parameters,
+            delivery_id=delivery_id,
+            on_started=on_started,
+        )
+        return self._continue_handoff(
+            state,
+            on_event=on_event,
+            interrupt=interrupt,
+            steering=steering,
+            cancel_requested=cancel_requested,
+            suspend_requested=suspend_requested,
+            request_parameters=request_parameters,
+        )
+
+    def _continue_handoff(
+        self,
+        state: RunState,
+        *,
+        on_event: EventHandler | None,
+        interrupt: InterruptHandler | None,
+        steering: SteeringHandler | None,
+        cancel_requested: CancellationHandler | None,
+        suspend_requested: CancellationHandler | None,
+        request_parameters: Mapping[str, Any] | None,
+    ) -> RunState:
+        """Continue one completed Plan handoff through optional compaction and Agent execution."""
+
+        handoff = state.handoff
+        if handoff is None:
+            return state
+        if self.runtime is None:
+            raise RuntimeError("Conversation runtime is unavailable for handoff.")
+        source_session_id = (
+            self.active_session.session_id if self.active_session is not None else self.runtime.state.session_id
+        )
+        bridge = self.runtime_node_bridge
+        if handoff.compact_before:
+            try:
+                if bridge is not None:
+                    bridge.finalize_current("success")
+                self.runner.compact_context(self.runtime)
+                if bridge is not None:
+                    bridge.finalize_current("success")
+                if self.runtime.model_nodes():
+                    self.runtime.state.messages = self.runtime.model_messages()
+                    self.runtime.save()
+            except Exception as exc:
+                safe_message = safe_error_message(exc)
+                self.runtime.state.running_mode = "plan"
+                state.mode = "plan"
+                if bridge is not None and not bridge.closed:
+                    bridge.record_compaction_failure(safe_message)
+                    bridge.closed = True
+                return state
+        handoff_prompt = handoff.task
+        if bridge is not None and not bridge.closed:
+            bridge.start_child(handoff_prompt, running_mode=handoff.mode)
+        follow_up = self._run_single_turn(
+            InputMessage(handoff_prompt),
+            mode=handoff.mode,
+            on_event=on_event,
+            interrupt=interrupt,
+            steering=steering,
+            cancel_requested=cancel_requested,
+            suspend_requested=suspend_requested,
+            active_skills=handoff.active_skills,
+            trigger="handoff",
+            source_session_id=source_session_id,
+            source_run_id=state.run_id,
+            request_parameters=request_parameters,
+        )
+        if follow_up.handoff is not None:
+            raise RuntimeError("Nested run handoffs are not supported.")
+        return follow_up
+
+    def _run_single_turn(
+        self,
+        message: InputMessage,
+        *,
+        mode: RunMode,
+        on_event: EventHandler | None,
+        interrupt: InterruptHandler | None,
+        steering: SteeringHandler | None,
+        cancel_requested: CancellationHandler | None,
+        suspend_requested: CancellationHandler | None,
+        active_skills: tuple[SkillSnapshot, ...] = (),
+        trigger: RunTrigger = "embedding",
+        source_session_id: str | None = None,
+        source_run_id: str | None = None,
+        request_parameters: Mapping[str, Any] | None = None,
+        delivery_id: str | None = None,
+        on_started: Callable[[], None] | None = None,
+    ) -> RunState:
+        prepared = message.text
+        provenance = RunProvenance(
+            trigger=trigger,
+            workspace_root=getattr(self.runner, "workspace_root", None),
+            project_cwd=getattr(self.runner, "project_cwd", None),
+            source_session_id=source_session_id,
+            source_run_id=source_run_id,
+        )
+        if self.session_store is not None:
+            session = self.ensure_session(prepared)
+            self._ensure_runtime(session.session_id)
+            assert self.runtime is not None
+            if self.runtime.state.status == "running":
+                raise RuntimeError("The active session already has a running turn; resume or terminate it first.")
+            run_id = new_run_id()
+            self.session_store.start_turn(
+                session.session_id,
+                run_id,
+                prepared,
+                provenance,
+                delivery_id=delivery_id,
+                thread_id=self.runtime.state.thread_id,
+            )
+        else:
+            if self.runtime is None:
+                self.runtime = self.runner.empty_runtime(session_id=new_session_id())
+                self.runtime.state.timezone = self.default_timezone
+                self.runtime.state.thread_id = self.thread_id or self.runtime.state.session_id
+            if self.runtime.state.status == "running":
+                raise RuntimeError("The active session already has a running turn; resume or terminate it first.")
+            run_id = new_run_id()
+        assert self.runtime is not None
+        turn_start_index = len(self.runtime.state.messages)
+        self.runtime.state.messages.append(UserMessage(content=prepared))
+        self.runtime.state.current_run = RunState(
+            task=prepared,
+            mode=mode,
+            run_id=run_id,
+            turn_start_index=turn_start_index,
+            thread_id=self.runtime.state.thread_id,
+            history=self.runtime.state.messages,
+            active_skills=list(active_skills),
+            provenance=provenance,
+        )
+        self.runtime.state.active_message = None
+        self.runtime.state.active_tool_index = None
+        self.runtime.state.turn_usage = None
+        self.runtime.state.status = "running"
+        self.runtime.services.runtime_store = self.session_store
+        self.runtime.services.on_event = on_event
+        self.runtime.services.interrupt = interrupt
+        self.runtime.services.steering = steering
+        self.runtime.services.cancel_requested = cancel_requested
+        self.runtime.services.suspend_requested = suspend_requested
+        if request_parameters:
+            self.runtime.state.request_parameters.update(dict(request_parameters))
+        runtime = self.runner.bind(self.runtime)
+        # The canonical message-tree bridge is installed for embedding
+        # executions as well as Web SSE.  Web attaches a bridge
+        # ahead of time so it can expose the active dynamic leaf to PATCH;
+        # local callers get an equivalent bridge here.
+        self._bind_node_bridge(message, on_event, running_mode=mode)
+        # ``mode`` is the initial runtime configuration for this turn.  The
+        # runner refreshes ``RunState.mode`` from ``state.running_mode`` at
+        # dispatch time and the bridge's ``bind_runtime`` derives it from the
+        # latest durable node, so an explicitly requested mode must be
+        # re-applied after both: otherwise a Plan review handoff to an agent
+        # run would silently inherit the previous node's ``plan`` mode.
+        if mode in {"agent", "plan"}:
+            self.runtime.state.running_mode = mode
+        try:
+            if on_started is not None:
+                on_started()
+            state = self.runner.run(runtime)
+        except MessageQueueUnavailable as exc:
+            self._record_unexpected_failure(exc, publish_error=False)
+            raise
+        except Exception as exc:
+            bridge = self.runtime_node_bridge
+            if bridge is not None and not self._node_bridge_events_external:
+                bridge.finish_exception(exc)
+            self._record_unexpected_failure(exc)
+            raise
+        bridge = self.runtime_node_bridge
+        if bridge is not None and not self._node_bridge_events_external and state.handoff is None:
+            if state.status in {"completed", "success"}:
+                bridge.finish("success", state.final_answer or "")
+            elif state.status == "cancelled":
+                bridge.finish("paused", state.final_answer or "", category="user")
+            elif bridge.abort_category is not None:
+                bridge.finish(
+                    "paused" if bridge.abort_category == "network" else "failed",
+                    state.final_answer or "",
+                    category=bridge.abort_category,
+                    code=bridge.abort_code,
+                )
+            else:
+                bridge.finish("failed", state.final_answer or "", category="agent", code="runtime_failed")
+        if self.session_store is not None and self.active_session is not None:
+            self.session_store.finish_turn(
+                self.active_session.session_id,
+                state.run_id,
+                state.status,
+                state.final_answer,
+            )
+            self._reload_active_session()
+        self.conversation = text_messages(runtime.state.messages)
+        # A bridge is scoped to one turn.  Keep the final durable tree in the
+        # store, but do not let a closed dynamic sidecar receive a later turn's
+        # configuration or events.
+        if bridge is not None and bridge.closed:
+            self.runtime_node_bridge = None
+            self._node_bridge_events_external = False
+        return state
+
+    def prepare_resume(self, session_id: str | None = None, *, turn_id: str | None = None) -> ResumePreview:
+        return prepare_resume(self, session_id, turn_id=turn_id)
+
+    def resume_session(
+        self,
+        session_id: str | None = None,
+        *,
+        on_event: EventHandler | None = None,
+        interrupt: InterruptHandler | None = None,
+        steering: SteeringHandler | None = None,
+        cancel_requested: CancellationHandler | None = None,
+        suspend_requested: CancellationHandler | None = None,
+        request_parameters: Mapping[str, Any] | None = None,
+        resume_confirmed: bool = False,
+        turn_id: str | None = None,
+    ) -> RunState | None:
+        state = resume_conversation(
+            self,
+            session_id,
+            on_event=on_event,
+            interrupt=interrupt,
+            steering=steering,
+            cancel_requested=cancel_requested,
+            suspend_requested=suspend_requested,
+            request_parameters=request_parameters,
+            resume_confirmed=resume_confirmed,
+            turn_id=turn_id,
+        )
+        if state is None:
+            return None
+        return self._continue_handoff(
+            state,
+            on_event=on_event,
+            interrupt=interrupt,
+            steering=steering,
+            cancel_requested=cancel_requested,
+            suspend_requested=suspend_requested,
+            request_parameters=request_parameters,
+        )
+
+    def _record_unexpected_failure(
+        self,
+        error: Exception,
+        *,
+        publish_error: bool = True,
+    ) -> None:
+        if self.runtime is None or self.runtime.state.current_run is None:
+            return
+        message = safe_error_message(error)
+        run = self.runtime.state.current_run
+        run.status = "failed"
+        boundary = min(max(run.turn_start_index, 0), len(self.runtime.state.messages))
+        assistant = next(
+            (item for item in reversed(self.runtime.state.messages[boundary:]) if isinstance(item, AssistantMessage)),
+            None,
+        )
+        if assistant is None:
+            self.runtime.state.messages.append(AssistantMessage(content=message))
+        elif message not in (assistant.content or ""):
+            assistant.content = f"{assistant.content}\n\n{message}".strip()
+        run.history = self.runtime.state.messages
+        run.final_answer = message
+        self.runtime.state.status = "idle"
+        self.runtime.state.usage = self.runtime.state.turn_usage
+        self.runtime.state.turn_usage = None
+        todo_store = self.runtime.services.todo_store
+        if todo_store is not None and run.turn_id:
+            todo_store.expire_turn(self.runtime.state.session_id, run.turn_id)
+        publish = self.runtime.services.publish
+        if publish is not None:
+            publish(RuntimeEvent("thinking_end", data={"interrupted": True}))
+            if publish_error:
+                publish(
+                    RuntimeEvent(
+                        "error",
+                        message,
+                        {"error_type": error.__class__.__name__, "unexpected": True},
+                    )
+                )
+            publish(RuntimeEvent("run_finished", run.status, {"final_answer": run.final_answer}))
+        self.runtime.save()
+        if self.session_store is not None and self.active_session is not None:
+            self.session_store.finish_turn(
+                self.active_session.session_id,
+                run.run_id,
+                run.status,
+                run.final_answer,
+            )

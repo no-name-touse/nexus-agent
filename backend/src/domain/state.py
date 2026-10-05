@@ -1,0 +1,121 @@
+"""State owned by an Agent run, independent of how it is displayed or executed."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any, Literal
+from uuid import uuid4
+
+from .messages import ChatMessage, ToolMessage
+from .skills import SkillSnapshot
+
+RunMode = Literal["agent", "plan"]
+RunStatus = Literal[
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+]
+RunStopReason = Literal[
+    "execution_failed",
+    "user_cancelled",
+    "user_paused",
+    "user_terminated",
+    "process_interrupted",
+]
+RunTrigger = Literal["embedding", "handoff", "resume", "legacy"]
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def new_run_id() -> str:
+    return f"run_{uuid4().hex}"
+
+
+def new_workflow_id() -> str:
+    return f"workflow_{uuid4().hex}"
+
+
+@dataclass(frozen=True)
+class RunProvenance:
+    """Immutable identity and ancestry for one workflow attempt."""
+
+    workflow_id: str = field(default_factory=new_workflow_id)
+    attempt: int = 1
+    trigger: RunTrigger = "embedding"
+    workspace_root: str | None = None
+    project_cwd: str | None = None
+    source_session_id: str | None = None
+    source_run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryCheckpoint:
+    """The last durable boundary from which an interrupted run is inspected."""
+
+    reason: str
+    timestamp: str
+    call_id: str | None = None
+    exchange_id: str | None = None
+    interruption: str | None = None
+    indeterminate_call_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunHandoff:
+    """A follow-up run requested by the completed current run."""
+
+    mode: RunMode
+    task: str
+    compact_before: bool = False
+    active_skills: tuple[SkillSnapshot, ...] = ()
+
+
+@dataclass
+class RunState:
+    task: str
+    mode: RunMode
+    run_id: str = field(default_factory=new_run_id)
+    thread_id: str = ""
+    turn_id: str = ""
+    data_idx: int = 0
+    turn_start_index: int = 0
+    history: list[ChatMessage] = field(default_factory=list)
+    actions: list[ToolMessage] = field(default_factory=list)
+    completed_steps: list[int] = field(default_factory=list)
+    final_answer: str | None = None
+    model_turns: int = 0
+    skill_selection_calls: int = 0
+    model_calls: int = 0
+    tool_calls: int = 0
+    retries: int = 0
+    status: RunStatus = "running"
+    stop_reason: RunStopReason | None = None
+    handoff: RunHandoff | None = None
+    active_skills: list[SkillSnapshot] = field(default_factory=list)
+    provenance: RunProvenance = field(default_factory=RunProvenance)
+    checkpoint: RecoveryCheckpoint | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        from .state_codec import run_state_to_dict
+
+        return run_state_to_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RunState:
+        """Rebuild persisted state without coupling the domain to a storage backend."""
+
+        from .state_codec import run_state_from_dict
+
+        return run_state_from_dict(data)
+
+
+# New message-tree state is intentionally kept in its own dependency-free
+# module.  Re-export it here for callers that historically imported all state
+# values from ``backend.domain.state``.
+from .runtime_state import RuntimeState  # noqa: E402  (compatibility export)
+
+RuntimeStateNode = RuntimeState

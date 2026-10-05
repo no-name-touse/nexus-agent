@@ -1,0 +1,438 @@
+import type { ChatMessage, Conversation, DecisionRequest, FileReference, RuntimeStateNode, RuntimeTreeNode, ToolEvent, TurnItem } from "../../types";
+import { isRuntimeTurnNode } from "./runtimeNodeNormalization";
+
+const keyOf = (turn: RuntimeTreeNode) => `${turn.session_id}:${turn.id}`;
+const LEGACY_UNKNOWN_ERROR = "An unknown error caused the system to encounter an exception.";
+
+function text(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
+
+function references(item: TurnItem): FileReference[] | undefined {
+  const raw = item.references;
+  if (!Array.isArray(raw)) return undefined;
+  const result = raw.flatMap((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const record = value as Record<string, unknown>;
+    return (record.source === "project" || record.source === "upload" || record.source === "workspace")
+      && typeof record.path === "string"
+      && typeof record.display_path === "string"
+      ? [{ source: record.source, path: record.path, display_path: record.display_path } as FileReference]
+      : [];
+  });
+  return result.length ? result : undefined;
+}
+
+function assistantMessageIndex(turn: RuntimeStateNode): number {
+  const selected = turn.data[turn.current_data_idx] ?? [];
+  for (let index = selected.length - 1; index >= 0; index -= 1) {
+    if (selected[index]?.role === "assistant") return index;
+  }
+  return -1;
+}
+
+interface AssistantMessageRun {
+  start: number;
+  end: number;
+}
+
+function assistantMessageRun(turn: RuntimeStateNode, messageIdx: number): AssistantMessageRun | undefined {
+  const selected = turn.data[turn.current_data_idx] ?? [];
+  if (selected[messageIdx]?.role !== "assistant") return undefined;
+  let start = messageIdx;
+  let end = messageIdx;
+  while (start > 0 && selected[start - 1]?.role !== "user") start -= 1;
+  while (start < messageIdx && selected[start]?.role === "developer") start += 1;
+  while (end + 1 < selected.length && selected[end + 1]?.role !== "user") end += 1;
+  return { start, end };
+}
+
+function visibleAssistantItems(turn: RuntimeStateNode, messageIdx = assistantMessageIndex(turn)): TurnItem[] {
+  const selected = turn.data[turn.current_data_idx];
+  const items = selected?.[messageIdx]?.role === "assistant" ? selected[messageIdx].content : [];
+  if (items[0]?.type !== "compaction") return items;
+  const kept = Number(items[0].kept_item_count ?? 0);
+  const keptEnd = 1 + Math.max(0, kept);
+  if (items[1]?.type !== "todo_snapshot") return items.slice(keptEnd);
+  return [items[1], ...items.slice(keptEnd + 1)];
+}
+
+function isToolApproval(item: TurnItem): boolean {
+  return item.type === "approval" && typeof item.tool === "string" && item.tool.length > 0;
+}
+
+function isHiddenChatError(item: TurnItem): boolean {
+  return item.type === "error" && !item.error_report
+    && (item.code === "ModelTransportError" || item.message === LEGACY_UNKNOWN_ERROR);
+}
+
+function displayAssistantItems(turn: RuntimeStateNode, items: TurnItem[]): TurnItem[] {
+  const planResults = items.filter((item) => item.type === "tool_result" && item.tool === "request_plan_review" && item.status === "success");
+  const plans = new Set(planResults.map((item) => text(item.content).trim()));
+  const toolResults = new Map<string, TurnItem>();
+  for (const item of items) {
+    if (item.type === "tool_result" && typeof item.call_id === "string") toolResults.set(item.call_id, item);
+  }
+
+  const displayed: TurnItem[] = [];
+  for (let index = 0; index < items.length;) {
+    const item = items[index];
+    // Plan lifecycle records remain in Trace; the editable result owns the chat body.
+    if (planResults.length && ((item.type === "plan" && ["plan", "handoff_created"].includes(String(item.event)))
+      || (item.type === "text" && plans.has(text(item.text).trim())))) {
+      index += 1;
+      continue;
+    }
+    if (item.type === "skill_snapshot" || isHiddenChatError(item)) {
+      index += 1;
+      continue;
+    }
+    if (!isToolApproval(item)) {
+      const deliveryId = typeof item.delivery_id === "string" ? item.delivery_id : "";
+      const reportStatus = deliveryId ? turn.agent_report_statuses?.[deliveryId] : undefined;
+      displayed.push(reportStatus ? { ...item, report_status: reportStatus } : item);
+      index += 1;
+      continue;
+    }
+
+    const tool = String(item.tool);
+    const callId = typeof item.call_id === "string" ? item.call_id : undefined;
+    const approvals: TurnItem[] = [item];
+    index += 1;
+    while (callId && index < items.length && isToolApproval(items[index])
+      && items[index].call_id === callId && String(items[index].tool) === tool) {
+      approvals.push(items[index]);
+      index += 1;
+    }
+    const decision = [...approvals].reverse().find(
+      (approval) => approval.event === "decision_requested" && typeof approval.decision_id === "string",
+    );
+    const result = typeof callId === "string" ? toolResults.get(callId) : undefined;
+    const granted = approvals.some((approval) => approval.event === "approval_granted");
+
+    if (result || granted) {
+      displayed.push({
+        ...(decision ?? approvals[0]),
+        type: "approval",
+        event: "approval_resolved",
+        approval_status: result?.failure_code === "user_denied" ? "denied" : "allowed",
+        call_id: callId,
+        tool,
+        text: "",
+      });
+    } else if (turn.status === "running" && decision) {
+      displayed.push({ ...decision, call_id: callId, tool });
+    }
+  }
+  return displayed;
+}
+
+function itemEvents(items: TurnItem[], compactionNotice: boolean, completed: boolean): ToolEvent[] {
+  const events: ToolEvent[] = [];
+  if (compactionNotice) {
+    events.push({ kind: "compaction", message: "上下文已压缩" });
+  }
+  for (const item of items) {
+    if (item.type === "reasoning") {
+      events.push({ kind: "thinking", message: text(item.text), data: { completed } });
+    } else if (item.type === "tool_call") {
+      events.push({ kind: "tool_call", message: String(item.name ?? "工具"), data: { ...item } });
+    } else if (item.type === "tool_result") {
+      events.push({ kind: item.status === "failed" ? "tool_failed" : "tool_result", message: text(item.content), data: { ...item } });
+    } else if (item.type === "retry") {
+      events.push({ kind: "model_retry", message: text(item.message), data: { ...item } });
+    } else if (["approval", "question", "plan", "subagent", "skill_snapshot"].includes(item.type)) {
+      events.push({ kind: item.type, message: text(item.text), data: { ...item } });
+    }
+  }
+  return events;
+}
+
+function pendingDecision(items: TurnItem[], status: RuntimeStateNode["status"]): DecisionRequest | undefined {
+  if (status !== "running") return undefined;
+  const decisionItems = items.filter((item) => item.type === "approval" || item.type === "question");
+  const latest = decisionItems[decisionItems.length - 1];
+  if (!latest || latest.event !== "decision_requested" || typeof latest.decision_id !== "string") return undefined;
+  const kind = latest.kind;
+  if (!["tool", "plan", "question", "resume", "skill"].includes(String(kind))) return undefined;
+  return {
+    decision_id: latest.decision_id,
+    kind: kind as DecisionRequest["kind"],
+    approval_kind: latest.approval_kind === "sandbox_escalation" ? "sandbox_escalation" : undefined,
+    cwd: typeof latest.cwd === "string" ? latest.cwd : undefined,
+    message: typeof latest.text === "string" ? latest.text : undefined,
+    tool: typeof latest.tool === "string" ? latest.tool : undefined,
+    arguments: latest.arguments as DecisionRequest["arguments"],
+    plan: typeof latest.plan === "string" ? latest.plan : undefined,
+    plan_path: typeof latest.plan_path === "string" ? latest.plan_path : undefined,
+    goal: typeof latest.goal === "string" ? latest.goal : undefined,
+    steps: Array.isArray(latest.steps) ? latest.steps.map(String) : undefined,
+    details: typeof latest.details === "string" ? latest.details : undefined,
+    questions: Array.isArray(latest.questions) ? latest.questions as DecisionRequest["questions"] : undefined,
+    skill: typeof latest.skill === "string" ? latest.skill : undefined,
+    description: typeof latest.description === "string" ? latest.description : undefined,
+    project_id: typeof latest.project_id === "string" ? latest.project_id : undefined,
+    workspace_sha256: typeof latest.workspace_sha256 === "string" ? latest.workspace_sha256 : undefined,
+    tree_sha256: typeof latest.tree_sha256 === "string" ? latest.tree_sha256 : undefined,
+    path: typeof latest.path === "string" ? latest.path : undefined,
+  };
+}
+
+export interface ProjectedNodeDetails {
+  role: string;
+  content: string;
+  events: ToolEvent[];
+  items: TurnItem[];
+  compactionNotice: boolean;
+  error?: string;
+  errorSuppressed: boolean;
+  references?: FileReference[];
+  status?: RuntimeStateNode["status"];
+  decision?: DecisionRequest;
+}
+
+export function projectRuntimeNode(turn: RuntimeStateNode, messageIdx = assistantMessageIndex(turn)): ProjectedNodeDetails {
+  const run = assistantMessageRun(turn, messageIdx);
+  const sourceItems: TurnItem[] = [];
+  let compactionNotice = false;
+  if (run) {
+    for (let index = run.start; index <= run.end; index += 1) {
+      const message = turn.data[turn.current_data_idx]?.[index];
+      if (message?.content?.[0]?.type === "compaction") compactionNotice = true;
+      sourceItems.push(...visibleAssistantItems(turn, index));
+    }
+  }
+  const items = displayAssistantItems(turn, sourceItems);
+  const errorItem = [...items].reverse().find((item) => item.type === "error");
+  return {
+    role: "assistant",
+    content: items.filter((item) => item.type === "text" || item.type === "bash").map((item) => text(item.text)).join(""),
+    events: itemEvents(sourceItems, compactionNotice, turn.status !== "running"),
+    items,
+    compactionNotice,
+    error: errorItem ? text(errorItem.message) : undefined,
+    errorSuppressed: errorItem === undefined && sourceItems.some(isHiddenChatError),
+    status: turn.status,
+    decision: pendingDecision(items, turn.status),
+  };
+}
+
+function ancestry(nodes: Map<string, RuntimeTreeNode>, active: RuntimeStateNode, allowPartial: boolean | ReadonlySet<string>): RuntimeTreeNode[] {
+  const path: RuntimeTreeNode[] = [];
+  const seen = new Set<string>();
+  let current: RuntimeTreeNode | undefined = active;
+  while (current) {
+    const key = keyOf(current);
+    if (seen.has(key)) throw new Error("Turn ancestry contains a cycle");
+    seen.add(key);
+    path.push(current);
+    if (!isRuntimeTurnNode(current)) break;
+    if (!current.parent_id) break;
+    const parentKey = `${current.parent_session_id}:${current.parent_id}`;
+    current = nodes.get(parentKey);
+    const permittedBoundary = allowPartial === true || (typeof allowPartial !== "boolean" && allowPartial.has(parentKey));
+    if (!current && !permittedBoundary) throw new Error("Turn ancestry is incomplete");
+  }
+  return path.reverse();
+}
+
+export function projectTurnPath(nodes: Map<string, RuntimeTreeNode>, activeTurnId: string, allowPartial: boolean | ReadonlySet<string> = false): ChatMessage[] {
+  const active = [...nodes.values()].find((turn) => turn.id === activeTurnId);
+  if (!active || !isRuntimeTurnNode(active)) return [];
+  return ancestry(nodes, active, allowPartial).flatMap((turn) => {
+    if (!isRuntimeTurnNode(turn)) return [];
+    const selected = turn.data[turn.current_data_idx];
+    if (!selected) return [];
+    const result: ChatMessage[] = [];
+    for (let messageIdx = 0; messageIdx < selected.length;) {
+      const message = selected[messageIdx];
+      if (message.role === "user") {
+        const next = selected.slice(messageIdx + 1).find((entry) => entry.role !== "developer");
+        const compact = next?.role === "assistant" && next.content[0]?.type === "compaction";
+        if (compact) {
+          messageIdx += 1;
+          continue;
+        }
+        const userItem = message.content[0];
+        const parent = nodes.get(turn.parent_session_id + ":" + turn.parent_id);
+        const handoff = parent && isRuntimeTurnNode(parent) && parent.data[parent.current_data_idx]?.some((entry) =>
+          entry.content.some((item) => item.type === "plan" && item.event === "handoff_created" && item.text === userItem?.text));
+        result.push({
+          id: `${turn.id}:message:${messageIdx}`,
+          role: "user",
+          content: text(userItem?.text),
+          approvedPlanHandoff: Boolean(handoff),
+          ...(handoff ? { timelineText: "已批准计划，开始实施" } : {}),
+          events: [],
+          nodeId: turn.id,
+          sourceNodeId: turn.parent_id || undefined,
+          references: userItem ? references(userItem) : undefined,
+          timelineSource: typeof message.delivery_id === "string" ? "steering" : "user",
+          deliveryId: typeof message.delivery_id === "string" ? message.delivery_id : undefined,
+        });
+        messageIdx += 1;
+        continue;
+      }
+      const run = assistantMessageRun(turn, messageIdx);
+      if (!run) {
+        messageIdx += 1;
+        continue;
+      }
+      const assistant = projectRuntimeNode(turn, run.start);
+      const isLatestMessage = run.end === selected.length - 1;
+      if (assistant.compactionNotice || assistant.content || assistant.events.length || assistant.error || ((turn.status === "running" || turn.status === "paused") && isLatestMessage)) {
+        result.push({
+          id: `${turn.id}:message:${run.start}`,
+          role: "assistant",
+          content: assistant.content,
+          events: assistant.events,
+          items: assistant.items,
+          itemVersion: turn.current_data_idx,
+          compactionNotice: assistant.compactionNotice,
+          status: isLatestMessage ? turn.status : undefined,
+          error: assistant.error,
+          running: isLatestMessage && turn.status === "running",
+          decision: isLatestMessage ? assistant.decision : undefined,
+          sourceNodeId: turn.id,
+          runtimeNodeIds: [keyOf(turn)],
+        });
+      }
+      messageIdx = run.end + 1;
+    }
+    return result;
+  });
+}
+
+export function messagesBeforeRewind(messages: ChatMessage[], turnId: string): ChatMessage[] {
+  const rewindIndex = messages.findIndex((message) => message.nodeId === turnId);
+  return rewindIndex >= 0 ? messages.slice(0, rewindIndex) : messages;
+}
+
+export function pruneTurnDescendants(nodes: RuntimeTreeNode[], turnId: string): RuntimeTreeNode[] {
+  const target = nodes.find((node) => node.id === turnId);
+  if (!target || !isRuntimeTurnNode(target)) return nodes;
+
+  const childrenByParent = new Map<string, RuntimeStateNode[]>();
+  for (const node of nodes) {
+    if (!isRuntimeTurnNode(node)) continue;
+    if (node.session_id !== target.session_id || node.thread_id !== target.thread_id || !node.parent_id) continue;
+    const parentKey = `${node.parent_session_id}:${node.parent_id}`;
+    const children = childrenByParent.get(parentKey);
+    if (children) children.push(node);
+    else childrenByParent.set(parentKey, [node]);
+  }
+
+  const descendantKeys = new Set<string>();
+  const pending = [...(childrenByParent.get(keyOf(target)) ?? [])];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    const key = keyOf(node);
+    if (descendantKeys.has(key)) continue;
+    descendantKeys.add(key);
+    pending.push(...(childrenByParent.get(key) ?? []));
+  }
+  if (descendantKeys.size === 0) return nodes;
+  return nodes.filter((node) => !descendantKeys.has(keyOf(node)));
+}
+
+export function integrateRuntimeNodeUpdates(
+  conversation: Conversation,
+  turns: RuntimeStateNode[],
+  activeTurnId: string,
+  forcePathProjection: boolean,
+): Conversation {
+  const current = new Map((conversation.runtimeNodes ?? []).map((node) => [keyOf(node), node] as const));
+  const previousNodes = new Map(current);
+  const pageBoundaries = new Set([...current.values()].filter(isRuntimeTurnNode)
+    .filter((node) => node.parent_id && !current.has(`${node.parent_session_id}:${node.parent_id}`))
+    .map((node) => `${node.parent_session_id}:${node.parent_id}`));
+  for (const turn of turns) {
+    const hasSessionTurn = [...current.values()].some((node) =>
+      isRuntimeTurnNode(node) && node.session_id === turn.session_id
+    );
+    const parentKey = `${turn.parent_session_id}:${turn.parent_id}`;
+    if (
+      !hasSessionTurn
+      && turn.parent_id
+      && turn.parent_session_id === turn.session_id
+      && turn.parent_thread_id === turn.session_id
+      && !current.has(parentKey)
+    ) {
+      current.set(parentKey, {
+        session_id: turn.parent_session_id,
+        thread_id: turn.parent_thread_id,
+        id: turn.parent_id,
+      });
+    }
+    current.set(keyOf(turn), turn);
+  }
+  const activeTurn = [...current.values()].find((turn) => turn.id === activeTurnId);
+  if (!activeTurn || !isRuntimeTurnNode(activeTurn)) throw new Error("Active Turn is missing after applying an SSE frame");
+
+  let messages: ChatMessage[];
+  const latestAssistantIdx = assistantMessageIndex(activeTurn);
+  const latestRun = assistantMessageRun(activeTurn, latestAssistantIdx);
+  const latestRunId = latestRun ? `${activeTurn.id}:message:${latestRun.start}` : undefined;
+  const assistantIndex = latestRunId
+    ? conversation.messages.findIndex((message) => message.role === "assistant" && message.id === latestRunId)
+    : -1;
+  const latestRunEndsTurn = latestRun?.end === activeTurn.data[activeTurn.current_data_idx].length - 1;
+  if (forcePathProjection || !latestRun || assistantIndex < 0 || !latestRunEndsTurn) {
+    messages = projectTurnPath(current, activeTurnId, pageBoundaries);
+    const previousMessages = new Map(conversation.messages.map((message) => [message.id, message]));
+    const unchangedTurns = new Set<string>();
+    for (const [key, node] of current) {
+      if (node !== previousNodes.get(key) || !isRuntimeTurnNode(node)) continue;
+      const parentKey = node.parent_session_id + ":" + node.parent_id;
+      if (current.get(parentKey) === previousNodes.get(parentKey)) unchangedTurns.add(node.id);
+    }
+    messages = messages.map((message) => {
+      const previous = previousMessages.get(message.id);
+      const turnId = message.role === "user" ? message.nodeId : message.sourceNodeId;
+      return previous && turnId && unchangedTurns.has(turnId) ? previous : message;
+    });
+    const delivered = new Set(messages.map((item) => item.deliveryId).filter(Boolean));
+    const retained = conversation.messages.filter((item) =>
+      item.role === "user" && (item.pending || item.error)
+      && item.deliveryId && !delivered.has(item.deliveryId)
+    );
+    messages.push(...retained);
+    if (conversation.hiddenBeforeTurnId) {
+      const prefix = `${conversation.hiddenBeforeTurnId}:message:`;
+      let hiddenIndex = -1;
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index].id.startsWith(prefix)) {
+          hiddenIndex = index;
+          break;
+        }
+      }
+      if (hiddenIndex >= 0) messages = messages.slice(hiddenIndex + 1);
+    }
+  } else {
+    const projection = projectRuntimeNode(activeTurn, latestRun.start);
+    messages = [...conversation.messages];
+    messages[assistantIndex] = {
+      ...messages[assistantIndex],
+      content: projection.content,
+      events: projection.events,
+      items: projection.items,
+      itemVersion: activeTurn.current_data_idx,
+      compactionNotice: projection.compactionNotice,
+      status: activeTurn.status,
+      error: projection.error,
+      running: activeTurn.status === "running",
+      decision: projection.decision,
+      runtimeNodeIds: [keyOf(activeTurn)],
+    };
+  }
+  return {
+    ...conversation,
+    runtimeNodes: [...current.values()],
+    messages,
+    activeTurnId,
+    lastNodeId: activeTurnId,
+    threadId: activeTurn.thread_id,
+  };
+}

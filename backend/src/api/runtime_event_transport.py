@@ -1,0 +1,438 @@
+"""Process-owned Runtime event publication and browser SSE."""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+from collections.abc import AsyncIterator
+from time import monotonic
+from uuid import uuid4
+
+from backend.domain.runtime_state import NodeFrame, RuntimeState
+from backend.storage.runtime_event_stream import RuntimeEventCursorExpired
+from backend.storage.sqlite import SQLiteSessionStore
+
+from .agent_report_projection import project_frame
+
+
+def _store(state) -> SQLiteSessionStore:
+    return SQLiteSessionStore(state.paths, getattr(state, "agent_thread_index", None))
+
+
+def _cursor_id(state, cursor: str) -> str:
+    epoch = getattr(state, "runtime_event_epoch", None)
+    if epoch is None:
+        epoch = uuid4().hex
+        state.runtime_event_epoch = epoch
+    return f"{epoch}|{cursor}"
+
+
+def _resume_cursor(state, cursor: str | None, latest: str) -> str:
+    epoch = _cursor_id(state, "").split("|", 1)[0]
+    if (
+        cursor
+        and cursor.startswith(f"{epoch}|")
+        and cursor.split("|", 1)[1].isdecimal()
+        and int(cursor.split("|", 1)[1]) <= int(latest)
+    ):
+        return cursor.split("|", 1)[1]
+    return latest
+
+
+def _runtime_snapshot(state, store, session_id: str, turn_id: str):
+    bridge = getattr(state, "live_turn_bridges", {}).get((session_id, turn_id))
+    if bridge is not None and not bridge.closed:
+        return bridge.writer.live_snapshot(session_id, turn_id)
+    snapshot = getattr(getattr(state, "subagent_coordinator", None), "live_turn_snapshot", None)
+    if callable(snapshot):
+        live = snapshot(session_id, turn_id)
+        if live is not None:
+            return live
+    return store.runtime_stream_snapshot(session_id, turn_id)
+
+
+async def _current_thread_snapshots(state, store, session_id: str, thread_id: str):
+    page = await asyncio.to_thread(store.load_turn_page, session_id, thread_id)
+    for candidate in page.turns:
+        if not isinstance(candidate, RuntimeState) or candidate.thread_id != thread_id:
+            continue
+        current, sequence = await asyncio.to_thread(_runtime_snapshot, state, store, session_id, candidate.id)
+        current = current or candidate
+        payload = await asyncio.to_thread(project_frame, store, NodeFrame.snapshot(current), current)
+        payload["revision"] = 0
+        payload["current_turn_id"] = page.current_turn_id
+        yield current.id, sequence, payload
+
+
+def publish_frame(state, frame: NodeFrame, current: RuntimeState) -> None:
+    cache = getattr(state, "conversation_cache", None)
+    if (
+        cache is not None
+        and current.status == "running"
+        and (frame.type == "turn.snapshot" or frame.patch.get("status") == "running")
+    ):
+        cache.begin(current.session_id, current.thread_id, current.id)
+    if frame.sequence:
+        payload = frame.to_dict()
+        if frame.type == "turn.snapshot" or any(
+            op.get("op") == "append_item" and op.get("item", {}).get("type") == "subagent" for op in frame.operations
+        ):
+            payload = project_frame(_store(state), frame, current)
+        state.runtime_event_stream.publish(
+            event_id=frame.event_id,
+            turn_id=frame.turn_id,
+            thread_id=current.thread_id,
+            sequence=frame.sequence,
+            payload=payload,
+        )
+        return
+    store = _store(state)
+    state.runtime_event_stream.publish(
+        event_id=frame.event_id,
+        turn_id=frame.turn_id,
+        thread_id=current.thread_id,
+        sequence=store.runtime_event_sequence(frame.session_id, frame.turn_id),
+        payload=project_frame(store, frame, current),
+    )
+
+
+def publish_terminal(
+    state,
+    *,
+    session_id: str,
+    thread_id: str,
+    turn_id: str,
+    terminal_type: str,
+    message: str = "",
+    error_report: object = None,
+) -> None:
+    _node, sequence = _store(state).runtime_stream_snapshot(session_id, turn_id)
+    state.runtime_event_stream.publish(
+        # Repeated completion callbacks publish a single terminal event.
+        event_id=f"terminal:{session_id}:{turn_id}:{sequence + 1}:{terminal_type}",
+        turn_id=turn_id,
+        thread_id=thread_id,
+        sequence=sequence + 1,
+        payload={
+            "type": "turn.terminal",
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "terminal_type": terminal_type,
+            "message": message,
+            "error_report": error_report,
+        },
+    )
+
+    cache = getattr(state, "conversation_cache", None)
+    if cache is not None:
+        cache.finish(thread_id, turn_id)
+    sync = getattr(state, "application_sync", None)
+    if sync is not None:
+        sync.publish("session.changed", session_id=session_id)
+
+
+def _terminal_envelope(
+    turn_id: str,
+    terminal_type: str,
+    message: str = "",
+    *,
+    event_id: str = "0-0",
+    error_report: object = None,
+) -> str:
+    safe_id = html.escape(turn_id, quote=True)
+    safe_type = html.escape(terminal_type, quote=True)
+    safe_message = html.escape(message, quote=False)
+    prefix = (
+        "data: " + json.dumps({"type": "turn.error", "error_report": error_report}, ensure_ascii=False) + "\n\n"
+        if error_report
+        else ""
+    )
+    return prefix + f'id: {event_id}\ndata: <SSE id="{safe_id}" type="{safe_type}">{safe_message}</SSE>\n\n'
+
+
+def _terminal_for_node(node: RuntimeState) -> tuple[str, str] | None:
+    if node.status == "running":
+        return None
+    return ("success" if node.status in {"success", "paused"} else "failed", "")
+
+
+def _node_has_delivery(node: RuntimeState, delivery_id: str) -> bool:
+    return any(
+        message.get("delivery_id") == delivery_id
+        or any(item.get("delivery_id") == delivery_id for item in message.get("content", []))
+        for version in node.data
+        for message in version
+    )
+
+
+def _matching_terminal(
+    payload: dict[str, object],
+    *,
+    session_id: str,
+    thread_id: str,
+    turn_id: str,
+) -> tuple[str, str] | None:
+    if (
+        payload.get("type") != "turn.terminal"
+        or payload.get("session_id") != session_id
+        or payload.get("thread_id") != thread_id
+        or payload.get("turn_id") != turn_id
+    ):
+        return None
+    return (
+        str(payload.get("terminal_type") or "failed"),
+        str(payload.get("message") or ""),
+    )
+
+
+def _turn_continuation(store: SQLiteSessionStore, session_id: str, thread_id: str, turn_id: str) -> list[RuntimeState]:
+    turns = [
+        node
+        for node in store.load_turn_page(session_id, thread_id).turns
+        if isinstance(node, RuntimeState) and node.thread_id == thread_id
+    ]
+    by_id = {node.id: node for node in turns}
+
+    def descends_from_requested(node: RuntimeState) -> bool:
+        current: RuntimeState | None = node
+        seen: set[str] = set()
+        while current is not None and current.id not in seen:
+            if current.id == turn_id:
+                return True
+            seen.add(current.id)
+            parent = by_id.get(current.parent_id)
+            current = parent if isinstance(parent, RuntimeState) else None
+        return False
+
+    return [node for node in turns if descends_from_requested(node)]
+
+
+async def turn_sse(
+    state,
+    session_id: str,
+    thread_id: str,
+    turn_id: str,
+    last_event_id: str | None = None,
+    delivery_id: str | None = None,
+) -> AsyncIterator[str]:
+    stream = state.runtime_event_stream
+    # One execution may hand off from a Plan Turn to compact/agent Turns. The
+    # Thread stream is the durable equivalent of the former process-local
+    # ActiveTurnStream aliases and keeps that execution observable end-to-end.
+    cursor = _resume_cursor(state, last_event_id, await asyncio.to_thread(stream.latest_thread_id, thread_id))
+    heartbeat_at = monotonic() + 15.0
+    while not stream.closed:
+        store = _store(state)
+        node, _baseline_sequence = await asyncio.to_thread(_runtime_snapshot, state, store, session_id, turn_id)
+        # Existing Turns are reused by rewind. Do not mistake the old sealed
+        # version for the newly accepted delivery while the message worker is
+        # still between claim and SQLite admission.
+        if node is not None and (not delivery_id or _node_has_delivery(node, delivery_id)):
+            break
+        latest_turn_event = await asyncio.to_thread(stream.latest_turn_event, turn_id) if node is None else None
+        if latest_turn_event is not None:
+            terminal = _matching_terminal(
+                latest_turn_event.payload,
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            if terminal is not None:
+                terminal_cursor = await asyncio.to_thread(stream.latest_thread_id, thread_id)
+                yield _terminal_envelope(
+                    turn_id,
+                    *terminal,
+                    event_id=_cursor_id(state, terminal_cursor),
+                    error_report=latest_turn_event.payload.get("error_report"),
+                )
+                return
+        entries = await asyncio.to_thread(stream.read_thread, thread_id, cursor, block_ms=50)
+        for entry in entries:
+            cursor = entry.stream_id
+            terminal = _matching_terminal(
+                entry.payload,
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            if terminal is not None:
+                yield _terminal_envelope(
+                    turn_id,
+                    *terminal,
+                    event_id=_cursor_id(state, cursor),
+                    error_report=entry.payload.get("error_report"),
+                )
+                return
+        if monotonic() >= heartbeat_at:
+            heartbeat_at = monotonic() + 15.0
+            yield ": heartbeat\n\n"
+    canonical_candidates = await asyncio.to_thread(_turn_continuation, store, session_id, thread_id, turn_id) or [node]
+    canonical_turns: list[RuntimeState] = []
+    baseline_sequences: dict[str, int] = {}
+    for candidate in canonical_candidates:
+        current, baseline_sequence = await asyncio.to_thread(_runtime_snapshot, state, store, session_id, candidate.id)
+        canonical_turns.append(current or candidate)
+        baseline_sequences[candidate.id] = baseline_sequence
+    active_streams = getattr(state, "active_turn_streams", {})
+    execution_active = isinstance(active_streams, dict) and turn_id in active_streams
+    terminal = _terminal_for_node(canonical_turns[-1])
+    if terminal is not None and not execution_active:
+        # No more Runtime frames can be committed for this execution. Advance
+        # the browser cursor to the terminal tail represented by the SQLite
+        # snapshot so a reconnect does not replay already-folded frames.
+        cursor = await asyncio.to_thread(stream.latest_thread_id, thread_id)
+    local_revisions: dict[str, int] = {}
+    for canonical in canonical_turns:
+        local_revisions[canonical.id] = 0
+        snapshot = await asyncio.to_thread(project_frame, store, NodeFrame.snapshot(canonical), canonical)
+        snapshot["revision"] = 0
+        yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    if terminal is not None and not execution_active:
+        yield _terminal_envelope(turn_id, *terminal, event_id=_cursor_id(state, cursor))
+        return
+
+    heartbeat_at = monotonic() + 15.0
+    while not stream.closed:
+        try:
+            entries = await asyncio.to_thread(stream.read_thread, thread_id, cursor, block_ms=1000)
+        except RuntimeEventCursorExpired:
+            cursor = await asyncio.to_thread(stream.latest_thread_id, thread_id)
+            async for node_id, sequence, payload in _current_thread_snapshots(state, store, session_id, thread_id):
+                baseline_sequences[node_id] = sequence
+                local_revisions[node_id] = 0
+                yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            continue
+        if not entries:
+            if monotonic() >= heartbeat_at:
+                heartbeat_at = monotonic() + 15.0
+                yield ": heartbeat\n\n"
+            continue
+        for entry in entries:
+            cursor = entry.stream_id
+            payload = dict(entry.payload)
+            if payload.get("type") == "turn.terminal":
+                if entry.sequence <= baseline_sequences.get(str(payload.get("turn_id") or ""), 0):
+                    continue
+                yield _terminal_envelope(
+                    turn_id,
+                    str(payload.get("terminal_type") or "failed"),
+                    str(payload.get("message") or ""),
+                    event_id=_cursor_id(state, cursor),
+                    error_report=payload.get("error_report"),
+                )
+                return
+            payload_turn_id = ""
+            if payload.get("type") == "turn.snapshot":
+                turn = payload.get("turn")
+                payload_turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+            elif payload.get("type") == "turn.delta":
+                payload_turn_id = str(payload.get("turn_id") or "")
+            if not payload_turn_id or entry.sequence <= baseline_sequences.get(payload_turn_id, 0):
+                continue
+            if payload.get("type") == "turn.snapshot":
+                local_revisions[payload_turn_id] = 0
+                payload["revision"] = 0
+            elif payload.get("type") == "turn.delta":
+                if payload_turn_id not in local_revisions:
+                    current, current_sequence = await asyncio.to_thread(
+                        _runtime_snapshot, state, store, session_id, payload_turn_id
+                    )
+                    if current is None:
+                        continue
+                    baseline_sequences[payload_turn_id] = current_sequence
+                    local_revisions[payload_turn_id] = 0
+                    snapshot = await asyncio.to_thread(project_frame, store, NodeFrame.snapshot(current), current)
+                    snapshot["revision"] = 0
+                    yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                    continue
+                local_revisions[payload_turn_id] += 1
+                payload["revision"] = local_revisions[payload_turn_id]
+            else:
+                continue
+            yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+async def thread_sse(state, session_id: str, thread_id: str, last_event_id: str | None = None) -> AsyncIterator[str]:
+    stream = state.runtime_event_stream
+    cache = getattr(state, "conversation_cache", None)
+    retained_on_connect = cache is not None and await asyncio.to_thread(cache.contains, thread_id)
+    cursor = _resume_cursor(state, last_event_id, await asyncio.to_thread(stream.latest_thread_id, thread_id))
+    yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps({'type': 'thread.ready', 'session_id': session_id, 'thread_id': thread_id}, separators=(',', ':'))}\n\n"
+    store = _store(state)
+    page = await asyncio.to_thread(store.load_turn_page, session_id, thread_id)
+    canonical_turns = [node for node in page.turns if isinstance(node, RuntimeState) and node.thread_id == thread_id]
+    baseline_sequences: dict[str, int] = {}
+    refreshed_turns: list[RuntimeState] = []
+    for candidate in canonical_turns:
+        current, baseline_sequence = await asyncio.to_thread(_runtime_snapshot, state, store, session_id, candidate.id)
+        node = current or candidate
+        refreshed_turns.append(node)
+        baseline_sequences[node.id] = baseline_sequence
+        snapshot = await asyncio.to_thread(project_frame, store, NodeFrame.snapshot(node), node)
+        snapshot["revision"] = 0
+        snapshot["current_turn_id"] = page.current_turn_id
+        yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    heartbeat_at = monotonic() + 15.0
+    revisions: dict[str, int] = {node.id: 0 for node in refreshed_turns}
+    while not stream.closed:
+        if retained_on_connect and not await asyncio.to_thread(cache.contains, thread_id):
+            yield 'data: {"type":"thread.evicted"}\n\n'
+            return
+        try:
+            entries = await asyncio.to_thread(stream.read_thread, thread_id, cursor, block_ms=1000)
+        except RuntimeEventCursorExpired:
+            cursor = await asyncio.to_thread(stream.latest_thread_id, thread_id)
+            async for node_id, sequence, payload in _current_thread_snapshots(state, store, session_id, thread_id):
+                baseline_sequences[node_id] = sequence
+                revisions[node_id] = 0
+                yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            continue
+        if not entries:
+            if monotonic() >= heartbeat_at:
+                heartbeat_at = monotonic() + 15.0
+                yield ": heartbeat\n\n"
+            continue
+        runtime_thread = await asyncio.to_thread(store.get_runtime_thread, session_id, thread_id)
+        if runtime_thread is None:
+            return
+        for entry in entries:
+            cursor = entry.stream_id
+            payload = dict(entry.payload)
+            if payload.get("type") == "turn.terminal":
+                if entry.sequence <= baseline_sequences.get(str(payload.get("turn_id") or ""), 0):
+                    continue
+                payload = {
+                    "type": "turn.terminal",
+                    "session_id": session_id,
+                    "thread_id": thread_id,
+                    "turn_id": str(payload.get("turn_id") or ""),
+                    "status": "success" if payload.get("terminal_type") == "success" else "failed",
+                }
+            elif payload.get("type") == "turn.snapshot":
+                turn = payload.get("turn")
+                turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+                if entry.sequence <= baseline_sequences.get(turn_id, 0):
+                    continue
+                baseline_sequences[turn_id] = entry.sequence
+                revisions[turn_id] = 0
+                payload["revision"] = 0
+            elif payload.get("type") == "turn.delta":
+                turn_id = str(payload.get("turn_id") or "")
+                if entry.sequence <= baseline_sequences.get(turn_id, 0):
+                    continue
+                revisions[turn_id] = revisions.get(turn_id, 0) + 1
+                payload["revision"] = revisions[turn_id]
+            else:
+                continue
+            payload["current_turn_id"] = runtime_thread.current_turn_id
+            yield f"id: {_cursor_id(state, cursor)}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+__all__ = [
+    "publish_frame",
+    "publish_terminal",
+    "thread_sse",
+    "turn_sse",
+]

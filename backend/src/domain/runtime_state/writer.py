@@ -1,0 +1,523 @@
+"""Persistence-aware writer for streaming Turn mutations."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from copy import copy
+from dataclasses import replace
+from threading import RLock
+from typing import Any
+
+from .contract import (
+    ITEM_STATUSES,
+    ItemStatus,
+    NodeStatus,
+    RuntimeStateValidationError,
+    _clone,
+    _json,
+    new_node_id,
+    normalize_content,
+    terminal_error_payload,
+    validate_data,
+)
+from .frames import _TURN_CONFIG_FIELDS, _TURN_IDENTITY_FIELDS, NodeFrame, TurnDeltaOperation
+from .models import RuntimeRootState, RuntimeState
+from .tree import RuntimeNodeStore
+
+
+class NodeWriter:
+    """Persist complete Turns while emitting one baseline and incremental updates."""
+
+    def __init__(
+        self,
+        store: RuntimeNodeStore,
+        *,
+        emit: Callable[[NodeFrame], None] | None = None,
+        id_factory: Callable[[], str] = new_node_id,
+        persist_delta: Callable[[NodeFrame, str, str], None] | None = None,
+        flush_persistence: Callable[[], None] | None = None,
+    ) -> None:
+        self.store = store
+        self.emit = emit or (lambda _frame: None)
+        self._emits_frames = emit is not None
+        self.id_factory = id_factory
+        self._dynamic: dict[tuple[str, str], RuntimeState] = {}
+        self._revisions: dict[tuple[str, str], int] = {}
+        self._lock = RLock()
+        self._sequences: dict[tuple[str, str], int] = {}
+        self._persist_delta = persist_delta
+        self.flush = flush_persistence or (lambda: None)
+
+    def live_snapshot(self, session_id: str, turn_id: str) -> tuple[RuntimeState, int]:
+        with self._lock:
+            return self.current(session_id, turn_id), self._sequences.get((session_id, turn_id), 0)
+
+    def view(self, session_id: str, turn_id: str) -> RuntimeState:
+        """Read-only, copy-on-write view for synchronous event delivery."""
+        with self._lock:
+            return self._dynamic.get((session_id, turn_id)) or self.current(session_id, turn_id)
+
+    def _number(self, frame: NodeFrame) -> NodeFrame:
+        key = (frame.session_id, frame.turn_id)
+        sequence = self._sequences.get(key, 0) + 1
+        self._sequences[key] = sequence
+        return replace(frame, sequence=sequence)
+
+    def _emit_snapshot(self, node: RuntimeState, *, persist: bool = False) -> None:
+        if not self._emits_frames:
+            if persist:
+                self.store.update_node(node)
+            return
+        self.flush()
+        frame = self._number(NodeFrame.snapshot(node))
+        if persist:
+            persist_frame = getattr(self.store, "update_node_with_frame", None)
+            if callable(persist_frame):
+                persist_frame(node, frame)
+            else:
+                self.store.update_node(node)
+        self._revisions[node.key] = 0
+        self.emit(frame)
+
+    def _emit_delta(
+        self,
+        node: RuntimeState,
+        *,
+        patch: Mapping[str, Any] | None = None,
+        operations: Sequence[TurnDeltaOperation] = (),
+        persist: bool = False,
+    ) -> None:
+        if not self._emits_frames:
+            if persist:
+                self.store.update_node(node)
+            return
+        if not patch and not operations:
+            if persist:
+                self.store.update_node(node)
+            return
+        previous = self._revisions.get(node.key)
+        if previous is None:
+            raise RuntimeStateValidationError("A Turn delta requires a baseline snapshot.")
+        revision = previous + 1
+        frame = self._number(
+            NodeFrame(
+                "turn.delta",
+                node.session_id,
+                node.id,
+                revision,
+                patch={str(key): _clone(value) for key, value in (patch or {}).items()},
+                operations=tuple(_clone(list(operations))),
+            )
+        )
+        if persist:
+            if self._persist_delta is not None:
+                self._persist_delta(frame, node.thread_id, node.status)
+            else:
+                persist_frame = getattr(self.store, "update_node_with_frame", None)
+                if callable(persist_frame):
+                    persist_frame(node, frame)
+                else:
+                    self.store.update_node(node)
+        self._revisions[node.key] = revision
+        if patch and patch.get("status") in {"success", "paused", "failed"}:
+            self.flush()
+            self.store.update_node(node)
+        self.emit(frame)
+
+    def _store_dynamic(self, node: RuntimeState, *, persist: bool) -> RuntimeState:
+        del persist
+        value = RuntimeState.from_dict(node.to_dict())
+        self._dynamic[value.key] = value.clone()
+        return value
+
+    def create(self, node: RuntimeState | None = None, **kwargs: Any) -> RuntimeState:
+        with self._lock:
+            if node is None:
+                kwargs.setdefault("id", self.id_factory())
+                node = RuntimeState.create(**kwargs)
+            self.flush()
+            frame = self._number(NodeFrame.snapshot(node))
+            persist_frame = getattr(self.store, "create_node_with_frame", None)
+            if callable(persist_frame):
+                persist_frame(node, frame)
+            else:
+                self.store.create_node(node)
+            self._dynamic[node.key] = node.clone()
+            if self._emits_frames:
+                self._revisions[node.key] = 0
+                self.emit(frame)
+            return node.clone()
+
+    def snapshot(self, node: RuntimeState) -> RuntimeState:
+        """Seed an existing Turn as this stream's baseline."""
+
+        with self._lock:
+            self.flush()
+            sequence = getattr(self.store, "runtime_event_sequence", None)
+            if callable(sequence):
+                self._sequences[node.key] = sequence(node.session_id, node.id)
+            value = RuntimeState.from_dict(node.to_dict())
+            self._dynamic[value.key] = value.clone()
+            self._emit_snapshot(value, persist=True)
+            return value.clone()
+
+    def adopt(self, node: RuntimeState) -> RuntimeState:
+        """Use an already-persisted Turn as the baseline without emitting it again."""
+
+        with self._lock:
+            self.flush()
+            sequence = getattr(self.store, "runtime_event_sequence", None)
+            if callable(sequence):
+                self._sequences[node.key] = sequence(node.session_id, node.id)
+            value = RuntimeState.from_dict(node.to_dict())
+            self._dynamic[value.key] = value.clone()
+            if self._emits_frames:
+                self._revisions[value.key] = 0
+            return value.clone()
+
+    def current(self, session_id: str, node_id: str) -> RuntimeState:
+        with self._lock:
+            value = self._dynamic.get((session_id, node_id)) or self.store.get_node(session_id, node_id)
+            if value is None:
+                raise KeyError(node_id)
+            if isinstance(value, RuntimeRootState):
+                raise RuntimeStateValidationError("A root Turn cannot be updated.")
+            return value.clone()
+
+    def update(self, node: RuntimeState, *, persist: bool = False) -> RuntimeState:
+        with self._lock:
+            previous = self.current(node.session_id, node.id)
+            value = RuntimeState.from_dict(node.to_dict())
+            previous_revision = self._revisions.get(value.key)
+            if self._emits_frames and previous_revision is None:
+                raise RuntimeStateValidationError("A Turn delta requires a baseline snapshot.")
+            revision = (previous_revision or 0) + 1
+            frame = NodeFrame.delta(previous, value, revision=revision) if self._emits_frames else None
+            value = self._store_dynamic(value, persist=persist)
+            if frame is not None:
+                self._emit_delta(value, patch=frame.patch, operations=frame.operations, persist=persist)
+            elif persist:
+                self.flush()
+                self.store.update_node(value)
+            return value.clone()
+
+    def update_data(self, node: RuntimeState, data: Any, *, persist: bool = False) -> RuntimeState:
+        current = self.current(node.session_id, node.id)
+        current.data = validate_data(data)
+        return self.update(current, persist=persist)
+
+    def update_config(self, node: RuntimeState, **changes: Any) -> RuntimeState:
+        with self._lock:
+            current = self.current(node.session_id, node.id)
+            before = current.to_dict()
+            for name, value in changes.items():
+                if name == "firstKeptItemSize":
+                    name = "first_kept_item_size"
+                elif name == "compactionId":
+                    name = "compaction_id"
+                if name not in _TURN_CONFIG_FIELDS:
+                    raise RuntimeStateValidationError(f"Unsupported Turn field: {name}")
+                setattr(current, name, _clone(value))
+            value = self._store_dynamic(current, persist=True)
+            after = value.to_dict()
+            patch = {
+                name: _clone(item)
+                for name, item in after.items()
+                if name not in {*_TURN_IDENTITY_FIELDS, "data"} and before.get(name) != item
+            }
+            self._emit_delta(value, patch=patch, persist=True)
+            return value.clone()
+
+    def append_item(self, node: RuntimeState, item: Mapping[str, Any], *, persist: bool = True) -> RuntimeState:
+        return self.append_items(node, [item], persist=persist)
+
+    def append_report(self, node: RuntimeState, delivery_id: str, reply_content: str) -> RuntimeState:
+        """Commit the report, delivery state and frame sequence before publishing."""
+        with self._lock:
+            self.flush()
+            current = self.current(node.session_id, node.id)
+            message = {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "subagent",
+                        "event": "agent_report",
+                        "status": "success",
+                        "text": reply_content,
+                        "delivery_id": delivery_id,
+                    }
+                ],
+            }
+            messages = current.data[current.current_data_idx]
+            revision = self._revisions.get(node.key, 0) + 1
+            sequence = self._sequences.get(node.key, 0) + 1
+            frame = (
+                NodeFrame(
+                    "turn.delta",
+                    node.session_id,
+                    node.id,
+                    revision,
+                    operations=(
+                        {
+                            "op": "append_message",
+                            "data_idx": current.current_data_idx,
+                            "message_idx": len(messages),
+                            "message": message,
+                        },
+                    ),
+                    sequence=sequence,
+                )
+                if self._emits_frames
+                else None
+            )
+            value = self.store.append_agent_report(
+                node.session_id,
+                node.thread_id,
+                delivery_id=delivery_id,
+                reply_content=reply_content,
+                frame=frame,
+            )
+            self._dynamic[node.key] = value.clone()
+            if frame is not None:
+                self._sequences[node.key] = sequence
+                self._revisions[node.key] = revision
+                self.emit(frame)
+            return value.clone()
+
+    def append_message(
+        self,
+        node: RuntimeState,
+        message: Mapping[str, Any],
+        *,
+        persist: bool = True,
+    ) -> RuntimeState:
+        with self._lock:
+            current = self.current(node.session_id, node.id)
+            messages = current.data[current.current_data_idx]
+            message_idx = len(messages)
+            messages.append(_json(message, "Message"))
+            current.data = validate_data(current.data)
+            value = self._store_dynamic(current, persist=persist)
+            self._emit_delta(
+                value,
+                operations=(
+                    {
+                        "op": "append_message",
+                        "data_idx": current.current_data_idx,
+                        "message_idx": message_idx,
+                        "message": _clone(messages[message_idx]),
+                    },
+                ),
+                persist=persist,
+            )
+            return value.clone()
+
+    def append_items(
+        self,
+        node: RuntimeState,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        message_idx: int | None = None,
+        persist: bool = True,
+    ) -> RuntimeState:
+        with self._lock:
+            current = self.current(node.session_id, node.id)
+            messages = current.data[current.current_data_idx]
+            target_idx = len(messages) - 1 if message_idx is None else message_idx
+            try:
+                target = messages[target_idx]
+            except IndexError as exc:
+                raise RuntimeStateValidationError("Turn Item target Message is out of range.") from exc
+            if target.get("role") != "assistant":
+                raise RuntimeStateValidationError("Turn Items can only be appended to an assistant Message.")
+            content = target["content"]
+            operations: list[TurnDeltaOperation] = []
+            for item in items:
+                normalized = normalize_content([item])[0]
+                operations.append(
+                    {
+                        "op": "append_item",
+                        "data_idx": current.current_data_idx,
+                        "message_idx": target_idx,
+                        "item_idx": len(content),
+                        "item": _clone(normalized),
+                    }
+                )
+                content.append(normalized)
+            current.data = validate_data(current.data)
+            value = self._store_dynamic(current, persist=persist)
+            self._emit_delta(value, operations=operations, persist=persist)
+            return value.clone()
+
+    def set_item_status(
+        self,
+        node: RuntimeState,
+        *,
+        data_idx: int,
+        message_idx: int,
+        item_idx: int,
+        status: ItemStatus,
+        persist: bool = True,
+    ) -> RuntimeState:
+        if status not in ITEM_STATUSES:
+            raise RuntimeStateValidationError("Item status must be running, failed, or success.")
+        with self._lock:
+            current = self.current(node.session_id, node.id)
+            try:
+                item = current.data[data_idx][message_idx]["content"][item_idx]
+            except (IndexError, KeyError) as exc:
+                raise RuntimeStateValidationError("Turn Item status target is out of range.") from exc
+            item["status"] = status
+            current.data = validate_data(current.data)
+            value = self._store_dynamic(current, persist=persist)
+            self._emit_delta(
+                value,
+                operations=(
+                    {
+                        "op": "set_item_status",
+                        "data_idx": data_idx,
+                        "message_idx": message_idx,
+                        "item_idx": item_idx,
+                        "status": status,
+                    },
+                ),
+                persist=persist,
+            )
+            return value.clone()
+
+    def append_text(
+        self,
+        node: RuntimeState,
+        *,
+        data_idx: int,
+        message_idx: int | None = None,
+        item_idx: int,
+        delta: str,
+        persist: bool = False,
+    ) -> RuntimeState:
+        if not delta:
+            return self.current(node.session_id, node.id)
+        with self._lock:
+            current = self._dynamic.get(node.key)
+            if current is None:
+                current = self.current(node.session_id, node.id)
+            try:
+                messages = current.data[data_idx]
+                target_idx = len(messages) - 1 if message_idx is None else message_idx
+                if messages[target_idx].get("role") != "assistant":
+                    raise RuntimeStateValidationError("Turn text delta must target an assistant Message.")
+                item = messages[target_idx]["content"][item_idx]
+            except IndexError as exc:
+                raise RuntimeStateValidationError("Turn text delta target is out of range.") from exc
+            if item.get("type") not in {"text", "reasoning"} or not isinstance(item.get("text"), str):
+                raise RuntimeStateValidationError("Turn text delta must target text or reasoning.")
+            # Copy only the path to the changed Item; previous views remain stable.
+            value = copy(current)
+            value.data = list(current.data)
+            value.data[data_idx] = list(messages)
+            changed_message = dict(messages[target_idx])
+            changed_message["content"] = list(messages[target_idx]["content"])
+            changed_message["content"][item_idx] = {**item, "text": item["text"] + delta}
+            if item["type"] == "reasoning" and isinstance(item.get("summary"), str):
+                changed_message["content"][item_idx]["summary"] = item["summary"] + delta
+            value.data[data_idx][target_idx] = changed_message
+            self._dynamic[value.key] = value
+            self._emit_delta(
+                value,
+                operations=(
+                    {
+                        "op": "append_text",
+                        "data_idx": data_idx,
+                        "message_idx": target_idx,
+                        "item_idx": item_idx,
+                        "delta": delta,
+                    },
+                ),
+                persist=persist,
+            )
+            return value
+
+    def set_reasoning_summary(
+        self, node: RuntimeState, *, message_idx: int, item_idx: int, key: str, text: str
+    ) -> RuntimeState:
+        with self._lock:
+            current = self._dynamic.get(node.key) or self.current(node.session_id, node.id)
+            item = current.data[current.current_data_idx][message_idx]["content"][item_idx]
+            if item.get("type") != "reasoning":
+                raise RuntimeStateValidationError("A reasoning summary must target a reasoning Item.")
+            previous = str(item.get("summary", ""))
+            if item.get("summary_key") == key and text.startswith(previous):
+                return self.append_text(
+                    current,
+                    data_idx=current.current_data_idx,
+                    message_idx=message_idx,
+                    item_idx=item_idx,
+                    delta=text[len(previous) :],
+                    persist=True,
+                )
+            current = current.clone()
+            item = current.data[current.current_data_idx][message_idx]["content"][item_idx]
+            if item.get("summary_key") == key:
+                prefix = item["text"][: len(item["text"]) - len(previous)]
+            else:
+                prefix = item["text"] + "\n\n" if item["text"] else ""
+            item.update(text=prefix + text, summary=text, summary_key=key)
+            value = self._store_dynamic(current, persist=True)
+            self._emit_delta(
+                value,
+                operations=(
+                    {
+                        "op": "set_reasoning_summary",
+                        "data_idx": current.current_data_idx,
+                        "message_idx": message_idx,
+                        "item_idx": item_idx,
+                        "text": item["text"],
+                        "summary": text,
+                        "summary_key": key,
+                    },
+                ),
+                persist=True,
+            )
+            return value.clone()
+
+    def restore_message_content(self, node: RuntimeState, lengths: list[int]) -> RuntimeState:
+        """Discard a failed model attempt and publish the corrected baseline."""
+        with self._lock:
+            current = self.current(node.session_id, node.id)
+            messages = current.data[current.current_data_idx]
+            for message, length in zip(messages, lengths):
+                message["content"] = message["content"][:length]
+            del messages[len(lengths) :]
+            result = self._store_dynamic(current, persist=True)
+            self._emit_snapshot(result, persist=True)
+            return result.clone()
+
+    def persist(self, node: RuntimeState) -> RuntimeState:
+        """Persist the current dynamic Turn without publishing another delta."""
+
+        with self._lock:
+            self.flush()
+            value = self._store_dynamic(node, persist=True)
+            self.store.update_node(value)
+            return value.clone()
+
+    def finalize(self, node: RuntimeState, status: NodeStatus) -> RuntimeState:
+        if status == "running":
+            raise RuntimeStateValidationError("A finalized Turn cannot remain running.")
+        with self._lock:
+            self.flush()
+            current = self.current(node.session_id, node.id)
+            current.status = status
+            result = self._store_dynamic(current, persist=True)
+            self._emit_delta(result, patch={"status": status}, persist=True)
+            self._dynamic.pop(result.key, None)
+            return result.clone()
+
+    def fail(self, session_id: str, node_id: str, message: str = "Execution failed.") -> RuntimeState:
+        node = self.current(session_id, node_id)
+        node = self.append_item(node, terminal_error_payload("agent", message, retryable=False))
+        return self.finalize(node, "failed")
+
+
+def recoverable(node: RuntimeState) -> bool:
+    return node.status == "paused"

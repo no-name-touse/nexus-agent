@@ -1,0 +1,1925 @@
+import { App as AntApp, Modal } from "antd";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { projectTurnPath } from "../../app/runtime/runtimeDetailProjection";
+import * as sessionOwnershipHook from "../../app/useSessionOwnership";
+import { TURN_PROTOCOL_VERSION } from "../../app/runtime/runtimeNodeNormalization";
+import type { QueuedMessage } from "../../app/types";
+import {
+  ApiError,
+  compactTurn,
+  createQueuedMessage,
+  deleteQueuedMessage,
+  getTurnPage,
+  listAgentThreadChildren,
+  patchRuntimeConfig,
+  searchSessionFiles,
+  sendAgentThreadMessage,
+  steerTurn,
+  streamAgentThread,
+  type ProviderConfig,
+} from "../../api";
+import type {
+  ChatMessage,
+  ChatMode,
+  Conversation,
+  ReasoningEffort,
+  RuntimeRootNode,
+  RuntimeStateNode,
+  TodoStatus,
+  ToolEvent,
+} from "../../types";
+import ChatPage, { CHAT_COMPACT_WIDTH, composerAction } from "./ChatPage";
+import { clearViewStateCache } from "../../app/viewState";
+
+const viewFixtures = vi.hoisted(() => new Map<string, Record<string, unknown>>());
+beforeEach(() => {
+  clearViewStateCache();
+  viewFixtures.clear();
+  vi.mocked(deleteQueuedMessage).mockClear();
+  vi.mocked(steerTurn).mockClear();
+});
+
+vi.mock("../../api/transport/request", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../api/transport/request")>();
+  const states = viewFixtures;
+  return { ...original, requestJson: vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.startsWith("/api/conversation-target/")) return {};
+    if (!url.startsWith("/api/view-state/")) return original.requestJson(url, init);
+    const [session_id, thread_id] = url.split("/").slice(-2);
+    const state = states.get(url) ?? { session_id, thread_id, revision: 0, draft: "", references: [], uploads: [], reading: null, expanded: {} };
+    if (init?.method === "PATCH") {
+      Object.assign(state, JSON.parse(String(init.body)), { revision: Number(state.revision) + 1 });
+      states.set(url, state);
+    }
+    return structuredClone(state);
+  }) };
+});
+
+vi.mock("../../api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../api")>(),
+  compactTurn: vi.fn(),
+  createQueuedMessage: vi.fn(),
+  deleteQueuedMessage: vi.fn().mockResolvedValue(undefined),
+  getTurnPage: vi.fn(),
+  listAgentThreadChildren: vi.fn(),
+  patchRuntimeConfig: vi.fn(),
+  searchSessionFiles: vi.fn(),
+  sendAgentThreadMessage: vi.fn(),
+  steerTurn: vi.fn().mockResolvedValue(undefined),
+  streamAgentThread: vi.fn(),
+}));
+
+function turn(id: string, userText: string, parent?: RuntimeStateNode): RuntimeStateNode {
+  return {
+    thread_id: "session-rewind",
+    parent_thread_id: parent?.thread_id ?? "",
+    session_id: "session-rewind",
+    parent_session_id: parent?.session_id ?? "",
+    id,
+    parent_id: parent?.id ?? "",
+    version: TURN_PROTOCOL_VERSION,
+    firstKeptItemSize: 8,
+    compactionId: id,
+    user: "user-1",
+    provider_name: "local",
+    model: {
+      reasoning_effort: "medium",
+      current_model: "test",
+      context_length: 4096,
+      output_length: 512,
+      thinking: "enable",
+      temperature: 0,
+    },
+    permission_mode: "read_only",
+    running_mode: "agent",
+    usage: { input_tokens: 1, cached_tokens: 0, output_tokens: 1, reasoning_tokens: 0, total_tokens: 2 },
+    cwd: "C:\\workspace",
+    project_cwd: "",
+    timestamp: `2026-08-26T00:00:0${parent ? 1 : 0}Z`,
+    status: "success",
+    current_data_idx: 0,
+    data: [[
+      { role: "user", content: [{ type: "text", text: userText, status: "success" }] },
+      { role: "assistant", content: [{ type: "text", text: `${userText}-answer`, status: "success" }] },
+    ]],
+  };
+}
+
+function Harness({
+  onRun,
+  onRewind,
+  onReload = vi.fn(),
+}: {
+  onRun: ReturnType<typeof vi.fn>;
+  onRewind: ReturnType<typeof vi.fn>;
+  onReload?: ReturnType<typeof vi.fn>;
+}) {
+  const root = turn("turn-root", "root");
+  const target = turn("turn-target", "target", root);
+  const descendant = turn("turn-descendant", "descendant", target);
+  const nodes = [root, target, descendant];
+  const map = new Map(nodes.map((node) => [`${node.session_id}:${node.id}`, node] as const));
+  const [queued, setQueued] = useState<QueuedMessage[]>([]);
+  const [conversation, setConversation] = useState<Conversation>({
+    id: "session-rewind",
+    sessionId: "session-rewind",
+    threadId: "session-rewind",
+    title: "rewind",
+    runtimeNodes: nodes,
+    activeTurnId: descendant.id,
+    lastNodeId: descendant.id,
+    messagesLoaded: true,
+    messages: projectTurnPath(map, descendant.id),
+  });
+
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        queuedMessages={queued}
+        onQueuedMessagesChange={(_id, updater) => setQueued(updater)}
+        onUpdate={(_id, updater) => setConversation((current) => updater(current))}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onEnsureSession={async () => conversation.sessionId!}
+        onRewind={onRewind}
+        onReload={onReload}
+        onRun={async (request) => { await onRun(request); }}
+      />
+      <output data-testid="runtime-node-ids">{conversation.runtimeNodes?.map((node) => node.id).join(",")}</output>
+      <output data-testid="active-turn-id">{conversation.activeTurnId}</output>
+      <output data-testid="visible-message-text">{conversation.messages.map((message) => message.content).join("|")}</output>
+    </AntApp>
+  );
+}
+
+function SubagentHarness({
+  onRun = vi.fn(),
+  includeChildTurn = true,
+}: {
+  onRun?: ReturnType<typeof vi.fn>;
+  includeChildTurn?: boolean;
+}) {
+  const root = turn("turn-root-agent", "root task");
+  root.status = "running";
+  const child = {
+    ...turn("turn-child-agent", "child task", root),
+    thread_id: "thread-child-agent",
+    parent_thread_id: root.thread_id,
+    status: "running" as const,
+  };
+  vi.mocked(getTurnPage).mockResolvedValue({ current_turn_id: includeChildTurn ? child.id : null, turns: includeChildTurn ? [root, child] : [], next_cursor: null, has_more: false });
+  const [conversation, setConversation] = useState<Conversation>({
+    id: "session-rewind",
+    sessionId: "session-rewind",
+    threadId: "session-rewind",
+    title: "Agent Threads",
+    runtimeNodes: includeChildTurn ? [root, child] : [root],
+    activeTurnId: root.id,
+    lastNodeId: root.id,
+    messagesLoaded: true,
+    messages: projectTurnPath(
+      new Map([[`${root.session_id}:${root.id}`, root]]),
+      root.id,
+    ),
+  });
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        agentThreadNavigation
+        onUpdate={(_id, updater) => setConversation((current) => updater(current))}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onRun={async (request) => { onRun(request); }}
+        onRewind={vi.fn()}
+        onFork={vi.fn()}
+      />
+      <output data-testid="subagent-canonical-thread">{conversation.threadId}</output>
+      <output data-testid="subagent-canonical-active">{conversation.activeTurnId}</output>
+    </AntApp>
+  );
+}
+
+function QueueHarness({
+  terminalStatus,
+  onRun,
+  runGate,
+  sandboxHealth,
+  onStopRun,
+}: {
+  terminalStatus: RuntimeStateNode["status"];
+  onRun: ReturnType<typeof vi.fn>;
+  runGate?: Promise<void>;
+  onStopRun?: ReturnType<typeof vi.fn>;
+  sandboxHealth?: { phase: "checking" | "healthy" | "unhealthy"; detail: string | null };
+}) {
+  const [node, setNode] = useState(() => {
+    const value = turn("turn-running", "running");
+    value.status = "running";
+    return value;
+  });
+  const [queued, setQueued] = useState<QueuedMessage[]>([
+    {
+      id: "queued-1",
+      thread_id: "session-rewind",
+      content: "第一条",
+      references: [{ source: "project", path: "C:/workspace/README.md", display_path: "README.md" }],
+      state: "pending",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    },
+    {
+      id: "queued-2",
+      thread_id: "session-rewind",
+      content: "第二条",
+      references: [
+        { source: "project", path: "C:/workspace/README.md", display_path: "README.md" },
+        { source: "upload", path: "C:/uploads/notes.txt", display_path: "notes.txt" },
+      ],
+      state: "pending",
+      created_at: "2026-01-01T00:00:01Z",
+      updated_at: "2026-01-01T00:00:01Z",
+    },
+  ]);
+  const conversation: Conversation = {
+    id: "session-rewind",
+    sessionId: "session-rewind",
+    threadId: "session-rewind",
+    title: "queue",
+    runtimeNodes: [node],
+    activeTurnId: node.id,
+    lastNodeId: node.id,
+    messagesLoaded: true,
+    messages: projectTurnPath(new Map([[`${node.session_id}:${node.id}`, node]]), node.id),
+  };
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        queuedMessages={queued}
+        onStopRun={onStopRun}
+        onQueuedMessagesChange={(_conversationId, updater) => setQueued((current) => updater(current))}
+        onQueuedMessagesRefresh={async () => {
+          const hasAcknowledgedDelivery = node.data[node.current_data_idx]
+            .some((item) => item.role === "user" && typeof item.delivery_id === "string");
+          if (hasAcknowledgedDelivery) {
+            setQueued((current) => current.filter((item) => item.state !== "dispatched"));
+            return;
+          }
+          const calls = vi.mocked(steerTurn).mock.calls;
+          const latest = calls[calls.length - 1];
+          const dispatchedIds = new Set(latest?.[2] ?? []);
+          setQueued((current) => current.map((item) => dispatchedIds.has(item.id)
+            ? { ...item, state: "dispatched" }
+            : item));
+        }}
+        onUpdate={() => undefined}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onEnsureSession={async () => conversation.sessionId!}
+        onRun={async (request) => {
+          onRun(request);
+          const accepted = turn("turn-queued", request.prompt ?? "");
+          if (request.queuedDelivery) {
+            accepted.data[0][0].delivery_id = "turn-start:" + accepted.id;
+            const submitted = new Set(request.queuedDelivery.messageIds);
+            setQueued((current) => current.filter((item) => !submitted.has(item.id)));
+          }
+          accepted.status = "running";
+          setNode(accepted);
+          request.onAccepted?.(accepted);
+          request.onBaseline?.(accepted);
+          if (runGate) {
+            await runGate;
+            setNode((current) => ({ ...current, status: "success" }));
+          }
+        }}
+        sandboxHealth={sandboxHealth}
+      />
+      <button type="button" onClick={() => setNode((current) => ({ ...current, status: terminalStatus }))}>
+        结束当前 Turn
+      </button>
+      <button type="button" onClick={() => setQueued((current) => [
+        ...current,
+        {
+          id: "queued-during-submit",
+          thread_id: "session-rewind",
+          content: "提交期间新增",
+          references: [],
+          state: "pending",
+          created_at: "2026-01-01T00:00:02Z",
+          updated_at: "2026-01-01T00:00:02Z",
+        },
+      ])}>
+        提交期间新增队列项
+      </button>
+      <button type="button" onClick={() => setNode((current) => {
+        const data = structuredClone(current.data);
+        data[current.current_data_idx].push({
+          role: "user",
+          delivery_id: "delivery-1",
+          content: [{ type: "text", text: "第一条", status: "success" }],
+        });
+        return { ...current, data };
+      })}>
+        确认 steering
+      </button>
+      <output data-testid="queued-count">{queued.length}</output>
+    </AntApp>
+  );
+}
+
+function ConfigHarness({
+  providerConfig,
+  status = "running",
+}: {
+  providerConfig?: ProviderConfig;
+  status?: RuntimeStateNode["status"];
+} = {}) {
+  const [mode, setMode] = useState<ChatMode>("agent");
+  const [conversation, setConversation] = useState<Conversation>(() => {
+    const node = turn("turn-config", "configure");
+    node.status = status;
+    return {
+      id: node.session_id,
+      sessionId: node.session_id,
+      threadId: node.thread_id,
+      title: "config",
+      runtimeNodes: [node],
+      activeTurnId: node.id,
+      lastNodeId: node.id,
+      messagesLoaded: true,
+      messages: projectTurnPath(new Map([[`${node.session_id}:${node.id}`, node]]), node.id),
+    };
+  });
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        providerConfig={providerConfig}
+        mode={mode}
+        onModeChange={setMode}
+        onUpdate={(_id, updater) => setConversation((current) => updater(current))}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onEnsureSession={async () => conversation.sessionId!}
+        onRun={async () => undefined}
+      />
+      <output data-testid="selected-mode">{mode}</output>
+    </AntApp>
+  );
+}
+
+function NewConversationTitleHarness({ onRun }: { onRun: ReturnType<typeof vi.fn> }) {
+  const [conversation, setConversation] = useState<Conversation>({
+    id: "session-title",
+    sessionId: "session-title",
+    threadId: "session-title",
+    title: "新对话",
+    runtimeNodes: [],
+    messagesLoaded: true,
+    messages: [],
+  });
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        onUpdate={(_id, updater) => setConversation((current) => updater(current))}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onEnsureSession={async () => conversation.sessionId!}
+        onRun={async (request) => { onRun(request); }}
+      />
+      <output data-testid="conversation-title">{conversation.title}</output>
+    </AntApp>
+  );
+}
+
+function scrollMessage(id: string, role: ChatMessage["role"], content: string): ChatMessage {
+  return { id, role, content, events: [] };
+}
+
+function ScrollHarness({
+  conversationId = "session-scroll",
+  messages,
+}: {
+  conversationId?: string;
+  messages: ChatMessage[];
+}) {
+  const conversation: Conversation = {
+    id: conversationId,
+    sessionId: conversationId,
+    threadId: conversationId,
+    title: "scroll",
+    messagesLoaded: true,
+    messages,
+  };
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        onUpdate={() => undefined}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onEnsureSession={async () => conversation.sessionId!}
+        onRun={async () => undefined}
+      />
+    </AntApp>
+  );
+}
+
+function TodoHarness({
+  status,
+  running,
+  activeTurnId = "turn-todo",
+}: {
+  status: TodoStatus;
+  running: boolean;
+  activeTurnId?: string;
+}) {
+  const todoId = "todo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const todoCall: ToolEvent = {
+    kind: "tool_call",
+    message: "update_todo_list",
+    data: {
+      name: "update_todo_list",
+      call_id: "todo-call",
+      status: "success",
+      arguments: { expected_revision: 0, operations: [{ op: "add", content: "完成 Todo 面板", status }] },
+    },
+  };
+  const todoResult: ToolEvent = {
+    kind: "tool_result",
+    message: JSON.stringify({
+      turn_id: "turn-todo",
+      revision: 1,
+      applied_operations: [{ op: "add", id: todoId, content: "完成 Todo 面板", status }],
+      counts: {
+        pending: status === "pending" ? 1 : 0,
+        in_progress: status === "in_progress" ? 1 : 0,
+        completed: status === "completed" ? 1 : 0,
+      },
+      todos: [{ id: todoId, content: "完成 Todo 面板", status }],
+    }),
+    data: { tool: "update_todo_list", call_id: "todo-call", status: "success" },
+  };
+  const conversation: Conversation = {
+    id: "session-todo",
+    sessionId: "session-todo",
+    threadId: "session-todo",
+    activeTurnId,
+    title: "todo",
+    runtimeNodes: [{ ...turn("turn-todo", "old Todo Turn"), session_id: "session-todo", thread_id: "session-todo", status: running ? "running" : "success" }],
+    messagesLoaded: true,
+    messages: [{
+      id: "assistant-todo",
+      role: "assistant",
+      content: "",
+      events: [todoCall, todoResult],
+      sourceNodeId: "turn-todo",
+    }],
+  };
+  return (
+    <AntApp>
+      <ChatPage
+        conversation={conversation}
+        onUpdate={() => undefined}
+        onNew={async () => conversation.id}
+        onNavigate={() => undefined}
+        onEnsureSession={async () => conversation.sessionId!}
+        onRun={async () => undefined}
+      />
+    </AntApp>
+  );
+}
+
+interface ScrollMetrics {
+  scrollHeight: number;
+  clientHeight: number;
+  scrollTop: number;
+}
+
+function mockScrollContainer(scrollContainer: HTMLDivElement, metrics: ScrollMetrics) {
+  Object.defineProperties(scrollContainer, {
+    scrollHeight: { configurable: true, get: () => metrics.scrollHeight },
+    clientHeight: { configurable: true, get: () => metrics.clientHeight },
+    scrollTop: {
+      configurable: true,
+      get: () => metrics.scrollTop,
+      set: (value: number) => {
+        metrics.scrollTop = Math.max(0, Math.min(value, Math.max(0, metrics.scrollHeight - metrics.clientHeight)));
+      },
+    },
+  });
+  const scrollTo = vi.fn((options: ScrollToOptions) => {
+    if (typeof options.top === "number") scrollContainer.scrollTop = options.top;
+    fireEvent.scroll(scrollContainer);
+  });
+  Object.defineProperty(scrollContainer, "scrollTo", { configurable: true, value: scrollTo });
+  return scrollTo;
+}
+
+describe("ChatPage bottom anchoring", () => {
+  it("shows the return button only beyond the 24px bottom threshold and scrolls smoothly on click", () => {
+    render(<ScrollHarness messages={[scrollMessage("assistant-1", "assistant", "answer")]} />);
+    const scrollContainer = document.querySelector<HTMLDivElement>("[data-conversation-scroll]")!;
+    const metrics = { scrollHeight: 1000, clientHeight: 600, scrollTop: 376 };
+    const scrollTo = mockScrollContainer(scrollContainer, metrics);
+
+    fireEvent.scroll(scrollContainer);
+    expect(screen.queryByRole("button", { name: "滚动到底部" })).not.toBeInTheDocument();
+
+    metrics.scrollTop = 375;
+    fireEvent.scroll(scrollContainer);
+    const button = screen.getByRole("button", { name: "滚动到底部" });
+    expect(button).toBeVisible();
+
+    fireEvent.click(button);
+    expect(scrollTo).toHaveBeenCalledWith({ top: 1000, behavior: "smooth" });
+    expect(metrics.scrollTop).toBe(400);
+    expect(screen.queryByRole("button", { name: "滚动到底部" })).not.toBeInTheDocument();
+  });
+
+  it("follows message growth only while the reader remains at the bottom", async () => {
+    const firstMessages = [scrollMessage("assistant-1", "assistant", "first")];
+    const view = render(<ScrollHarness messages={firstMessages} />);
+    const scrollContainer = document.querySelector<HTMLDivElement>("[data-conversation-scroll]")!;
+    const metrics = { scrollHeight: 1000, clientHeight: 600, scrollTop: 400 };
+    mockScrollContainer(scrollContainer, metrics);
+    fireEvent.scroll(scrollContainer);
+
+    metrics.scrollHeight = 1200;
+    view.rerender(<ScrollHarness messages={[...firstMessages, scrollMessage("assistant-2", "assistant", "streaming")]} />);
+    await waitFor(() => expect(metrics.scrollTop).toBe(600));
+
+    metrics.scrollTop = 300;
+    fireEvent.scroll(scrollContainer);
+    expect(screen.getByRole("button", { name: "滚动到底部" })).toBeVisible();
+
+    metrics.scrollHeight = 1400;
+    view.rerender(<ScrollHarness messages={[
+      ...firstMessages,
+      scrollMessage("assistant-2", "assistant", "streaming update"),
+      scrollMessage("user-2", "user", "sent while reading above"),
+    ]} />);
+    expect(metrics.scrollTop).toBe(300);
+    expect(screen.getByRole("button", { name: "滚动到底部" })).toBeVisible();
+  });
+
+  it("keeps pinned content at the bottom when its rendered height changes", () => {
+    const originalResizeObserver = window.ResizeObserver;
+    let contentResizeCallback: ResizeObserverCallback | undefined;
+    class MockResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe = (target: Element) => {
+        if (target.matches(".chat-scroll-content")) contentResizeCallback = this.callback;
+      };
+      unobserve() {}
+      disconnect() {}
+    }
+    window.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const view = render(<ScrollHarness messages={[scrollMessage("assistant-1", "assistant", "streaming")]} />);
+    try {
+      const scrollContainer = document.querySelector<HTMLDivElement>("[data-conversation-scroll]")!;
+      const metrics = { scrollHeight: 1000, clientHeight: 600, scrollTop: 400 };
+      mockScrollContainer(scrollContainer, metrics);
+      fireEvent.scroll(scrollContainer);
+
+      metrics.scrollHeight = 1250;
+      act(() => contentResizeCallback?.([], {} as ResizeObserver));
+      expect(metrics.scrollTop).toBe(650);
+      expect(screen.queryByRole("button", { name: "滚动到底部" })).not.toBeInTheDocument();
+    } finally {
+      view.unmount();
+      window.ResizeObserver = originalResizeObserver;
+    }
+  });
+
+  it("resets the scroll anchor when switching conversations", () => {
+    const view = render(<ScrollHarness conversationId="session-a" messages={[scrollMessage("a", "assistant", "a")]} />);
+    const scrollContainer = document.querySelector<HTMLDivElement>("[data-conversation-scroll]")!;
+    const metrics = { scrollHeight: 1000, clientHeight: 600, scrollTop: 200 };
+    mockScrollContainer(scrollContainer, metrics);
+    fireEvent.scroll(scrollContainer);
+    expect(screen.getByRole("button", { name: "滚动到底部" })).toBeVisible();
+
+    metrics.scrollHeight = 1200;
+    view.rerender(<ScrollHarness conversationId="session-b" messages={[scrollMessage("b", "assistant", "b")]} />);
+    expect(metrics.scrollTop).toBe(600);
+    expect(screen.queryByRole("button", { name: "滚动到底部" })).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatPage Todo panel lifecycle", () => {
+  it("keeps an incomplete running Todo expanded without a close action", async () => {
+    render(<TodoHarness status="in_progress" running />);
+
+    expect(await screen.findByText("任务清单")).toBeVisible();
+    expect(screen.getByText("完成 Todo 面板")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "关闭任务清单" })).not.toBeInTheDocument();
+    expect(document.querySelector(".composer")).toHaveClass("has-todo");
+  });
+
+  it("removes the panel and layout space as soon as every Todo completes", async () => {
+    const view = render(<TodoHarness status="in_progress" running />);
+    expect(await screen.findByText("任务清单")).toBeVisible();
+
+    view.rerender(<TodoHarness status="completed" running />);
+
+    expect(screen.queryByText("任务清单")).not.toBeInTheDocument();
+    expect(document.querySelector(".composer")).not.toHaveClass("has-todo");
+  });
+
+  it("resets a user-open panel to collapsed when its incomplete Turn ends", async () => {
+    const view = render(<TodoHarness status="in_progress" running />);
+    const header = (await screen.findByText("任务清单")).closest(".ant-collapse-header");
+    expect(header).not.toBeNull();
+    fireEvent.click(header!);
+    fireEvent.click(header!);
+    expect(screen.getByText("完成 Todo 面板")).toBeVisible();
+
+    view.rerender(<TodoHarness status="in_progress" running={false} />);
+
+    expect(screen.queryByText("完成 Todo 面板")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭任务清单" })).toBeVisible();
+  });
+
+  it("persists manual cleanup after an incomplete Turn ends across a page reload", async () => {
+    const view = render(<TodoHarness status="pending" running={false} />);
+
+    expect(await screen.findByText("任务清单")).toBeVisible();
+    expect(screen.queryByText("完成 Todo 面板")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭任务清单" }));
+
+    expect(screen.queryByText("任务清单")).not.toBeInTheDocument();
+    expect(document.querySelector(".composer")).not.toHaveClass("has-todo");
+    await waitFor(() => expect(viewFixtures.get("/api/view-state/session-todo/session-todo")?.expanded)
+      .toMatchObject({ "todo-panel:turn-todo": false }));
+    view.unmount();
+    clearViewStateCache();
+    render(<TodoHarness status="pending" running={false} />);
+    await act(async () => {});
+    expect(screen.queryByText("任务清单")).not.toBeInTheDocument();
+  });
+
+  it("does not fall back to a stale Todo Turn while a new active Turn is loading", () => {
+    render(
+      <TodoHarness
+        status="in_progress"
+        running
+        activeTurnId="turn-next"
+      />,
+    );
+
+    expect(screen.queryByText("任务清单")).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatPage rewind projection", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(compactTurn).mockReset();
+    vi.mocked(patchRuntimeConfig).mockReset();
+  });
+
+  it("keeps the default title while the backend generates the first-message title", async () => {
+    const onRun = vi.fn();
+    render(<NewConversationTitleHarness onRun={onRun} />);
+
+    await userEvent.type(screen.getByLabelText("聊天输入"), "这是一个超过十八字符的首条用户消息内容");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("conversation-title")).toHaveTextContent("新对话");
+  });
+
+  it("unlocks sending after admission without letting an older stream unlock a newer request", async () => {
+    const user = userEvent.setup();
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstRun = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondRun = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const onRun = vi.fn().mockReturnValueOnce(firstRun).mockReturnValueOnce(secondRun);
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+
+    try {
+      await user.type(screen.getByLabelText("聊天输入"), "first message");
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      expect(onRun).toHaveBeenCalledTimes(1);
+
+      await act(async () => onRun.mock.calls[0][0].onAccepted(turn("turn-first", "first message")));
+      await user.type(screen.getByLabelText("聊天输入"), "second message");
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(onRun).toHaveBeenCalledTimes(2));
+
+      await act(async () => releaseFirst());
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      expect(onRun).toHaveBeenCalledTimes(2);
+    } finally {
+      await act(async () => { releaseFirst(); releaseSecond(); });
+    }
+  });
+
+  it("does not keep a temporary message when Turn creation fails", async () => {
+    const onRun = vi.fn(async (request: { onAdmissionRejected?: () => void }) => {
+      request.onAdmissionRejected?.();
+      throw new Error("queue unavailable");
+    });
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+
+    const composer = screen.getByLabelText("聊天输入");
+    await userEvent.type(composer, "queue unavailable draft");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(composer.textContent).toBe("");
+    expect(screen.queryByText("queue unavailable draft", { selector: ".message *" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试发送" })).not.toBeInTheDocument();
+    expect(onRun).toHaveBeenCalledWith(expect.objectContaining({
+      onAccepted: expect.any(Function),
+      onAdmissionRejected: expect.any(Function),
+    }));
+    expect(onRun.mock.calls[0][0]).not.toHaveProperty("turnId", expect.any(String));
+    expect(onRun.mock.calls[0][0]).not.toHaveProperty("deliveryId");
+  });
+
+  it("clears immediately and never erases text entered before a delayed receipt", async () => {
+    let resolve!: () => void;
+    const gate = new Promise<void>((done) => { resolve = done; });
+    const onRun = vi.fn().mockReturnValue(gate);
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+    const editor = screen.getByLabelText("聊天输入");
+    try {
+      await userEvent.type(editor, "first prompt");
+      await userEvent.click(screen.getByRole("button", { name: "发送" }));
+      expect(editor.textContent).toBe("");
+      expect(screen.queryByText("first prompt", { selector: ".message *" })).not.toBeInTheDocument();
+      await userEvent.type(editor, "next draft");
+      await act(async () => onRun.mock.calls[0][0].onAccepted(turn("turn-backend", "first prompt")));
+      expect(editor).toHaveTextContent("next draft");
+    } finally {
+      await act(async () => resolve());
+    }
+  });
+
+  it("does not retain a temporary message when creating its session fails", async () => {
+    render(<AntApp><ChatPage conversation={null} onUpdate={vi.fn()} onNew={vi.fn().mockRejectedValue(new Error("session unavailable"))} onNavigate={vi.fn()} onRun={vi.fn()} /></AntApp>);
+    const editor = screen.getByLabelText("聊天输入");
+    await userEvent.type(editor, "unsaved first message");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "重试发送" })).not.toBeInTheDocument());
+    expect(editor.textContent).toBe("");
+    expect(screen.queryByText("unsaved first message", { selector: ".message *" })).not.toBeInTheDocument();
+    await userEvent.type(editor, "later draft");
+    expect(editor).toHaveTextContent("later draft");
+  });
+
+  it("does not send a frontend Turn or delivery identifier", async () => {
+    const onRun = vi.fn((request) => { request.onAccepted?.(turn("turn-backend", "created by backend")); });
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("聊天输入"), "created by backend");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(onRun.mock.calls[0][0].turnId).toBeUndefined();
+    expect(onRun.mock.calls[0][0]).not.toHaveProperty("deliveryId");
+    expect(screen.queryByText("created by backend", { selector: ".message *" })).not.toBeInTheDocument();
+  });
+
+  it("prunes descendants only after the rewind request is accepted", async () => {
+    const nativeGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudoElement) => {
+      const style = nativeGetComputedStyle(element, pseudoElement);
+      if (!(element instanceof HTMLTextAreaElement)) return style;
+      return new Proxy(style, {
+        get(target, property, receiver) {
+          if (property !== "getPropertyValue") return Reflect.get(target, property, receiver);
+          return (name: string) => {
+            const value = target.getPropertyValue(name);
+            if (value) return value;
+            if (name === "box-sizing") return "border-box";
+            if (["padding-bottom", "padding-top", "border-bottom-width", "border-top-width"].includes(name)) {
+              return "0px";
+            }
+            return value;
+          };
+        },
+      });
+    });
+    const onRun = vi.fn();
+    const onRewind = vi.fn().mockResolvedValue({
+      content: "target",
+      sessionId: "session-rewind",
+      sourceNodeId: "turn-target",
+      rewindTurnId: "turn-target",
+    });
+    const { container } = render(<Harness onRun={onRun} onRewind={onRewind} />);
+
+    await waitFor(() => expect(container.querySelectorAll(".user-bubble")).toHaveLength(3));
+    const targetBubble = container.querySelectorAll<HTMLElement>(".user-bubble")[1];
+    fireEvent.click(targetBubble);
+
+    expect(screen.getByTestId("runtime-node-ids")).toHaveTextContent(
+      "turn-root,turn-target,turn-descendant",
+    );
+    expect(screen.getByRole("textbox", { name: "编辑用户消息" })).toHaveValue("target");
+
+    fireEvent.click(screen.getByRole("button", { name: "保存并重新生成" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+
+    expect(onRun).toHaveBeenCalledWith(expect.objectContaining({
+      rewindTurnId: "turn-target",
+      sourceNodeId: undefined,
+      prompt: "target",
+    }));
+    expect(screen.getByTestId("runtime-node-ids")).toHaveTextContent("turn-root,turn-target,turn-descendant");
+    await act(async () => onRun.mock.calls[0][0].onAccepted());
+    expect(screen.getByTestId("runtime-node-ids")).toHaveTextContent("turn-root,turn-target");
+    expect(screen.getByTestId("active-turn-id")).toHaveTextContent("turn-target");
+    expect(screen.getByTestId("visible-message-text")).toHaveTextContent("root|root-answer|target");
+    expect(screen.getByTestId("visible-message-text")).not.toHaveTextContent("descendant");
+  });
+
+  it("keeps the original branch when rewind admission is rejected", async () => {
+    const onRun = vi.fn((request) => { request.onAdmissionRejected?.(); });
+    const onRewind = vi.fn().mockResolvedValue({ sessionId: "session-rewind", rewindTurnId: "turn-target" });
+    render(<Harness onRun={onRun} onRewind={onRewind} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "编辑" })[1]);
+    fireEvent.click(screen.getByRole("button", { name: "保存并重新生成" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("runtime-node-ids")).toHaveTextContent("turn-root,turn-target,turn-descendant");
+    expect(screen.getByTestId("active-turn-id")).toHaveTextContent("turn-descendant");
+    expect(screen.getByTestId("visible-message-text")).toHaveTextContent("root|root-answer|target|target-answer|descendant|descendant-answer");
+    expect(screen.queryByRole("button", { name: "重试发送" })).not.toBeInTheDocument();
+  });
+
+  it("blocks another send until the pending rewind has been accepted", async () => {
+    let finish!: () => void;
+    const onRun = vi.fn().mockReturnValue(new Promise<void>((resolve) => { finish = resolve; }));
+    const onRewind = vi.fn().mockResolvedValue({ sessionId: "session-rewind", rewindTurnId: "turn-target" });
+    render(<Harness onRun={onRun} onRewind={onRewind} />);
+    try {
+      await userEvent.type(screen.getByLabelText("聊天输入"), "next draft");
+      fireEvent.click(screen.getAllByRole("button", { name: "编辑" })[1]);
+      fireEvent.click(screen.getByRole("button", { name: "保存并重新生成" }));
+      await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+      expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+      fireEvent.keyDown(screen.getByLabelText("聊天输入"), { key: "Enter" });
+      expect(onRun).toHaveBeenCalledTimes(1);
+      await act(async () => onRun.mock.calls[0][0].onAccepted());
+      expect(screen.getByLabelText("聊天输入")).toHaveAttribute("contenteditable", "true");
+    } finally {
+      await act(async () => finish());
+    }
+  });
+
+  it("blocks message editing when another window owns the session", () => {
+    vi.spyOn(sessionOwnershipHook, "useSessionOwnership").mockReturnValue("readonly");
+    const onRewind = vi.fn();
+    const { container } = render(<Harness onRun={vi.fn()} onRewind={onRewind} />);
+    expect(screen.getAllByRole("button", { name: "编辑" }).every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
+    fireEvent.click(container.querySelectorAll<HTMLElement>(".user-bubble")[1]);
+    expect(screen.queryByRole("textbox", { name: "编辑用户消息" })).not.toBeInTheDocument();
+    expect(onRewind).not.toHaveBeenCalled();
+  });
+
+  it("blocks an open edit when session ownership is lost", () => {
+    const ownership = vi.spyOn(sessionOwnershipHook, "useSessionOwnership").mockReturnValue("writable");
+    const onRewind = vi.fn();
+    const onRun = vi.fn();
+    const { rerender } = render(<Harness onRun={onRun} onRewind={onRewind} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "编辑" })[1]);
+    ownership.mockReturnValue("readonly");
+    rerender(<Harness onRun={onRun} onRewind={onRewind} />);
+    expect(screen.getByRole("button", { name: "保存并重新生成" })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "编辑用户消息" }), { key: "Enter", ctrlKey: true });
+    expect(onRewind).not.toHaveBeenCalled();
+  });
+
+  it("shows an accessible shimmer while Compact is pending and reloads on success", async () => {
+    const user = userEvent.setup();
+    const onReload = vi.fn().mockResolvedValue(undefined);
+    let resolveCompact!: (value: RuntimeStateNode) => void;
+    vi.mocked(compactTurn).mockReturnValue(new Promise((resolve) => { resolveCompact = resolve; }));
+    render(<Harness onRun={vi.fn()} onRewind={vi.fn()} onReload={onReload} />);
+
+    await user.type(screen.getByLabelText("聊天输入"), "/compact");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const status = await screen.findByText("正在执行compaction操作中");
+    const progress = status.closest(".runtime-compaction-progress");
+    expect(progress).not.toBeNull();
+    expect(progress).toHaveAttribute("role", "status");
+    expect(progress).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("正在执行compaction操作中");
+    expect(progress?.querySelector(".shimmer-text.is-active")).not.toBeNull();
+    expect(vi.mocked(compactTurn)).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("聊天输入")).toHaveAttribute("contenteditable", "true");
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    expect(vi.mocked(compactTurn)).toHaveBeenCalledTimes(1);
+
+    resolveCompact(turn("turn-compact", "compact"));
+    await waitFor(() => expect(screen.queryByText("正在执行compaction操作中")).toBeNull());
+    expect(onReload).toHaveBeenCalledWith("session-rewind");
+    expect(vi.mocked(compactTurn)).toHaveBeenCalledTimes(1);
+  });
+
+  it("queues drafts during Compact and only sends them automatically after completion", async () => {
+    let finish!: (value: RuntimeStateNode) => void;
+    vi.mocked(compactTurn).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    vi.mocked(createQueuedMessage).mockImplementationOnce(async (threadId, id, content, references) => ({
+      id, thread_id: threadId, content, references: references ?? [], state: "pending",
+      created_at: "2026-09-14", updated_at: "2026-09-14",
+    }));
+    const onRun = vi.fn();
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("聊天输入"), "/compact");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await screen.findByText("正在执行compaction操作中");
+    await userEvent.type(screen.getByLabelText("聊天输入"), "after compact");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送第 1 条待发送消息" })).toBeDisabled());
+    expect(screen.getByLabelText("聊天输入").textContent).toBe("");
+    expect(onRun).not.toHaveBeenCalled();
+    expect(steerTurn).not.toHaveBeenCalled();
+    await act(async () => finish(turn("turn-compact", "compact")));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0].queuedDelivery.messageIds).toHaveLength(1);
+  });
+
+  it("removes the Compact shimmer and surfaces the request failure", async () => {
+    const user = userEvent.setup();
+    vi.mocked(compactTurn).mockRejectedValue(new Error("summary provider failed"));
+    render(<Harness onRun={vi.fn()} onRewind={vi.fn()} />);
+
+    await user.type(screen.getByLabelText("聊天输入"), "/compact");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(screen.queryByText("正在执行compaction操作中")).toBeNull());
+    expect(screen.getByText("summary provider failed", { selector: "p" })).toBeVisible();
+  });
+});
+
+describe("ChatPage composer completion", () => {
+  afterEach(() => {
+    vi.mocked(searchSessionFiles).mockReset();
+  });
+
+  it("selects a file with Enter without sending and never renders its absolute path", async () => {
+    const onRun = vi.fn();
+    const absolutePath = "C:/workspace/docs/README.md";
+    vi.mocked(searchSessionFiles).mockResolvedValue([{
+      source: "project",
+      path: absolutePath,
+      display_path: "docs/README.md",
+      name: "README.md",
+      size: 12,
+      mime: "text/markdown",
+      mtime: "2026-09-04T00:00:00Z",
+      is_image: false,
+    }]);
+    const { container } = render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+    const composer = screen.getByLabelText("聊天输入");
+
+    await userEvent.type(composer, "请查看 @read");
+    expect(await screen.findByText("docs/README.md", { selector: ".file-item-path" })).toBeVisible();
+    expect(container).not.toHaveTextContent(absolutePath);
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+
+    expect(await screen.findByText("docs/README.md", { selector: ".file-mention-label" })).toBeVisible();
+    expect(composer).toHaveTextContent("请查看 docs/README.md");
+    expect(composer.querySelectorAll("p")).toHaveLength(1);
+    expect(composer.querySelector('br:not([data-lexical-managed-linebreak="true"])')).toBeNull();
+    expect(composer.querySelector("p")?.lastChild?.textContent).toBe(" ");
+    expect(container).not.toHaveTextContent(absolutePath);
+    expect(onRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps command and file menus usable while a Turn is running", async () => {
+    const onRun = vi.fn();
+    vi.mocked(searchSessionFiles).mockResolvedValue([{
+      source: "upload",
+      path: "C:/session/uploads/notes.txt",
+      display_path: "notes.txt",
+      name: "notes.txt",
+      size: 5,
+      mime: "text/plain",
+      mtime: "2026-09-04T00:00:00Z",
+      is_image: false,
+    }]);
+    render(<QueueHarness terminalStatus="running" onRun={onRun} />);
+    const composer = screen.getByLabelText("聊天输入");
+
+    await userEvent.type(composer, "/he");
+    expect(await screen.findByText("/help", { selector: ".command-name" })).toBeVisible();
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(composer).toHaveTextContent(""));
+    expect(onRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+
+    await userEvent.type(composer, "@note");
+    expect(await screen.findByText("notes.txt", { selector: ".file-item-path" })).toBeVisible();
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+    expect(await screen.findByText("notes.txt", { selector: ".file-mention-label" })).toBeVisible();
+    expect(onRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+  });
+
+  it("uses Tab only to complete a command and executes it on the next Enter", async () => {
+    const onRun = vi.fn();
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+    const composer = screen.getByLabelText("聊天输入");
+
+    await userEvent.type(composer, "draft /he");
+    expect(await screen.findByText("/help", { selector: ".command-name" })).toBeVisible();
+    fireEvent.keyDown(composer, { key: "Tab", code: "Tab" });
+    await waitFor(() => expect(composer).toHaveTextContent("/help"));
+    expect(screen.queryByText("/help", { selector: ".command-name" })).not.toBeInTheDocument();
+    expect(onRun).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(composer).toHaveTextContent(""));
+    expect(onRun).not.toHaveBeenCalled();
+    expect(await screen.findByRole("heading", { name: "使用说明" })).toBeVisible();
+  });
+
+  it("executes a clicked command candidate and clears the whole draft", async () => {
+    const onRun = vi.fn();
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+    const composer = screen.getByLabelText("聊天输入");
+    await userEvent.type(composer, "discard this /he");
+    const command = await screen.findByText("/help", { selector: ".command-name" });
+
+    await userEvent.click(command.closest("button")!);
+
+    await waitFor(() => expect(composer).toHaveTextContent(""));
+    expect(onRun).not.toHaveBeenCalled();
+    expect(await screen.findByRole("heading", { name: "使用说明" })).toBeVisible();
+  });
+});
+
+describe("ChatPage running Turn configuration", () => {
+  afterEach(() => {
+    Modal.destroyAll();
+    vi.mocked(patchRuntimeConfig).mockReset();
+  });
+
+  it("optimistically patches mode and disables only that Select while pending", async () => {
+    const user = userEvent.setup();
+    let resolvePatch!: (node: RuntimeStateNode) => void;
+    vi.mocked(patchRuntimeConfig).mockReturnValue(new Promise((resolve) => { resolvePatch = resolve; }));
+    render(<ConfigHarness />);
+
+    await user.click(screen.getByRole("combobox", { name: "运行模式" }));
+    await user.click(await screen.findByRole("option", { name: /Plan/ }));
+
+    expect(screen.getByTestId("selected-mode")).toHaveTextContent("plan");
+    expect(screen.getByRole("combobox", { name: "运行模式" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "权限模式" })).not.toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "思考等级" })).not.toBeDisabled();
+    expect(patchRuntimeConfig).toHaveBeenCalledWith("session-rewind", expect.objectContaining({
+      node_id: "turn-config",
+      running_mode: "plan",
+    }));
+
+    const accepted = turn("turn-config", "configure");
+    accepted.status = "running";
+    accepted.running_mode = "plan";
+    await act(async () => resolvePatch(accepted));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "运行模式" })).not.toBeDisabled());
+    expect(screen.getByTestId("selected-mode")).toHaveTextContent("plan");
+  });
+
+  it("syncs current Provider model parameters only into a running Turn", async () => {
+    const providerConfig: ProviderConfig = {
+      id: "provider-local",
+      is_active: true,
+      provider_name: "local",
+      protocol: "chat_completions",
+      base_url: "https://example.test/v1",
+      model: "configured-model",
+      max_tokens: 1536,
+      context_size: 65536,
+      temperature: 0.7,
+      tokenizer_model: "",
+      api_key_configured: true,
+    };
+    vi.mocked(patchRuntimeConfig).mockImplementation(async (_sessionId, patch) => {
+      const accepted = turn("turn-config", "configure");
+      accepted.status = "running";
+      accepted.provider_name = patch.provider_name ?? accepted.provider_name;
+      accepted.model = { ...accepted.model, ...patch.model };
+      return accepted;
+    });
+
+    const runningView = render(<ConfigHarness providerConfig={providerConfig} />);
+    await waitFor(() => expect(patchRuntimeConfig).toHaveBeenCalledWith(
+      "session-rewind",
+      expect.objectContaining({
+        node_id: "turn-config",
+        provider_name: "local",
+        model: expect.objectContaining({
+          current_model: "configured-model",
+          output_length: 1536,
+          context_length: 65536,
+          temperature: 0.7,
+        }),
+      }),
+    ));
+    runningView.unmount();
+    vi.mocked(patchRuntimeConfig).mockClear();
+
+    render(<ConfigHarness providerConfig={providerConfig} status="success" />);
+    await waitFor(() => expect(patchRuntimeConfig).not.toHaveBeenCalled());
+  });
+
+  it("rolls back only the failed field", async () => {
+    const user = userEvent.setup();
+    vi.mocked(patchRuntimeConfig).mockRejectedValue(new Error("config write failed"));
+    render(<ConfigHarness />);
+
+    await user.click(screen.getByRole("combobox", { name: "运行模式" }));
+    await user.click(await screen.findByRole("option", { name: /Plan/ }));
+
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "运行模式" })).not.toBeDisabled());
+    expect(screen.getByTestId("selected-mode")).toHaveTextContent("agent");
+    expect(screen.getByText("config write failed")).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "权限模式" })).not.toBeDisabled();
+  });
+
+  it("keeps reasoning reconciliation independent from an older mode response", async () => {
+    const user = userEvent.setup();
+    let resolveMode!: (node: RuntimeStateNode) => void;
+    vi.mocked(patchRuntimeConfig).mockImplementation(async (_sessionId, values) => {
+      if (values.running_mode) return new Promise((resolve) => { resolveMode = resolve; });
+      const accepted = turn("turn-config", "configure");
+      accepted.status = "running";
+      accepted.model.reasoning_effort = "high";
+      return accepted;
+    });
+    render(<ConfigHarness />);
+
+    await user.click(screen.getByRole("combobox", { name: "运行模式" }));
+    await user.click(await screen.findByRole("option", { name: /Plan/ }));
+    await user.click(screen.getByRole("combobox", { name: "思考等级" }));
+    await user.click(await screen.findByRole("option", { name: "high" }));
+
+    await waitFor(() => expect(patchRuntimeConfig).toHaveBeenCalledWith(
+      "session-rewind",
+      expect.objectContaining({ model: { reasoning_effort: "high" } }),
+    ));
+    expect(screen.getByRole("combobox", { name: "思考等级" }).closest(".ant-select")).toHaveTextContent("high");
+
+    const modeAccepted = turn("turn-config", "configure");
+    modeAccepted.status = "running";
+    modeAccepted.running_mode = "plan";
+    await act(async () => resolveMode(modeAccepted));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "运行模式" })).not.toBeDisabled());
+    expect(screen.getByRole("combobox", { name: "思考等级" }).closest(".ant-select")).toHaveTextContent("high");
+  });
+
+  it("requires Full access confirmation and sends the acknowledgement", async () => {
+    const user = userEvent.setup();
+    const accepted = turn("turn-config", "configure");
+    accepted.status = "running";
+    accepted.permission_mode = "full_access";
+    vi.mocked(patchRuntimeConfig).mockResolvedValue(accepted);
+    render(<ConfigHarness />);
+
+    await user.click(screen.getByRole("combobox", { name: "权限模式" }));
+    await user.click(await screen.findByRole("option", { name: "完全访问" }));
+    expect((await screen.findAllByText("启用 Full access？")).length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("button", { name: /继\s*续/ }));
+
+    await waitFor(() => expect(patchRuntimeConfig).toHaveBeenCalledWith(
+      "session-rewind",
+      expect.objectContaining({ permission_mode: "full_access", full_access_acknowledged: true }),
+    ));
+  });
+});
+
+describe("ChatPage queued message flushing", () => {
+  it.each(["automatic", "manual"])("keeps a complete %s batch while its last item is saving", async (mode) => {
+    let finish!: (item: QueuedMessage) => void;
+    vi.mocked(createQueuedMessage).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={onRun} />);
+    await userEvent.type(screen.getByLabelText("聊天输入"), "third queued message");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    if (mode === "automatic") fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    else expect(screen.getByRole("button", { name: "追加指令" })).toBeDisabled();
+    expect(onRun).not.toHaveBeenCalled();
+    const calls = vi.mocked(createQueuedMessage).mock.calls;
+    const [threadId, id, content, references] = calls[calls.length - 1];
+    await act(async () => finish({ thread_id: threadId, id, content, references: references ?? [], state: "pending", created_at: "now", updated_at: "now" }));
+    if (mode === "manual") {
+      fireEvent.click(screen.getByRole("button", { name: "追加指令" }));
+      await waitFor(() => expect(steerTurn).toHaveBeenCalledWith("turn-running", expect.any(String), ["queued-1", "queued-2", id], "session-rewind"));
+    } else {
+      await waitFor(() => expect(onRun).toHaveBeenCalledWith(expect.objectContaining({ queuedDelivery: { messageIds: ["queued-1", "queued-2", id] } })));
+    }
+  });
+
+  it("blocks Agent controls and shows a temporary non-persisted failure bubble", async () => {
+    const onRun = vi.fn();
+    render(
+      <QueueHarness
+        terminalStatus="success"
+        onRun={onRun}
+        sandboxHealth={{ phase: "unhealthy", detail: "Broker service stopped" }}
+      />,
+    );
+
+    expect(document.querySelector(".sandbox-health-failure")).toHaveTextContent("Broker service stopped");
+    expect(screen.getByLabelText("聊天输入")).toHaveAttribute("contenteditable", "false");
+    expect(screen.getByRole("combobox", { name: "运行模式" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送第 1 条待发送消息" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "追加指令" })).toBeDisabled();
+    expect(screen.queryByText("沙箱 Broker 不可用：Broker service stopped", { selector: ".message.user *" })).toBeNull();
+    expect(onRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["success", "failed"] as const)(
+    "merges the persisted queue after a %s terminal",
+    async (terminalStatus) => {
+      const onRun = vi.fn();
+      render(<QueueHarness terminalStatus={terminalStatus} onRun={onRun} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+      await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+
+      expect(onRun).toHaveBeenCalledWith(expect.objectContaining({
+        prompt: null,
+        sourceNodeId: "turn-running",
+        waitForActiveRun: true,
+        queuedDelivery: {
+          messageIds: ["queued-1", "queued-2"],
+        },
+      }));
+      await waitFor(() => expect(screen.getByTestId("queued-count")).toHaveTextContent("0"));
+    },
+  );
+
+  it("keeps the queue local when a Turn becomes paused", async () => {
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="paused" onRun={onRun} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    expect(onRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+  });
+
+  it("uses the paused Turn state while the previous queue stream is still closing", async () => {
+    let finish!: () => void;
+    const runGate = new Promise<void>((resolve) => { finish = resolve; });
+    const onRun = vi.fn();
+    const view = render(<QueueHarness terminalStatus="success" onRun={onRun} runGate={runGate} />);
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+      await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+      view.rerender(<QueueHarness terminalStatus="paused" onRun={onRun} runGate={runGate} />);
+      fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    } finally {
+      await act(async () => finish());
+    }
+  });
+
+  it("sends a queued entry as a new Turn when paused instead of ignoring the click", async () => {
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="paused" onRun={onRun} />);
+    fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    await userEvent.click(screen.getByRole("button", { name: "发送第 1 条待发送消息" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0].queuedDelivery.messageIds).toEqual(["queued-1"]);
+  });
+
+  it("does not dispatch a queue entry while its deletion is in flight", async () => {
+    let finish!: () => void;
+    vi.mocked(deleteQueuedMessage).mockReturnValueOnce(new Promise<void>((resolve) => { finish = resolve; }));
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={onRun} />);
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "删除第 1 条待发送消息" }));
+      fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+      expect(onRun).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => finish());
+    }
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0].queuedDelivery.messageIds).toEqual(["queued-2"]);
+  });
+
+  it("sends one queued entry to the running Turn and waits for SSE acknowledgement", async () => {
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "发送第 1 条待发送消息" }));
+    await waitFor(() => expect(vi.mocked(steerTurn)).toHaveBeenCalledWith(
+      "turn-running",
+      expect.any(String),
+      ["queued-1"],
+      "session-rewind",
+    ));
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+    expect(screen.getByRole("button", { name: "发送第 1 条待发送消息" })).toBeDisabled();
+    expect(screen.getByText(/发送中/)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认 steering" }));
+    await waitFor(() => expect(screen.getByTestId("queued-count")).toHaveTextContent("1"));
+  });
+
+  it("starts a new Turn when steering reaches a finished Turn", async () => {
+    vi.mocked(steerTurn).mockRejectedValueOnce(new ApiError(409, "Turn has finished.", "turn_finished"));
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={onRun} />);
+    fireEvent.click(screen.getByRole("button", { name: "追加指令" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0]).toMatchObject({
+      sourceNodeId: "turn-running", queuedDelivery: { messageIds: ["queued-1", "queued-2"] },
+    });
+    expect(screen.queryByText("Turn has finished.")).toBeNull();
+  });
+
+  it("labels the queue action as steering and allows pause while delivery is pending", async () => {
+    const onStopRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} onStopRun={onStopRun} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "追加指令" }));
+    await waitFor(() => expect(vi.mocked(steerTurn)).toHaveBeenCalledWith(
+      "turn-running",
+      expect.any(String),
+      ["queued-1", "queued-2"],
+      "session-rewind",
+    ));
+    expect(screen.getAllByText(/发送中/)).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "暂停" }));
+    expect(onStopRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the queue draft before the backend replies and preserves the next draft", async () => {
+    let resolve!: (value: QueuedMessage) => void;
+    const gate = new Promise<QueuedMessage>((done) => { resolve = done; });
+    vi.mocked(createQueuedMessage).mockReturnValueOnce(gate);
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+    const editor = screen.getByLabelText("聊天输入");
+    await userEvent.type(editor, "new queued prompt");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(editor.textContent).toBe("");
+    expect(screen.getByText("new queued prompt")).toBeVisible();
+    await userEvent.type(editor, "later draft");
+    const calls = vi.mocked(createQueuedMessage).mock.calls;
+    const args = calls[calls.length - 1];
+    await act(async () => resolve({ id: args[1], thread_id: args[0], content: args[2], references: [], state: "pending", created_at: "now", updated_at: "now" }));
+    expect(editor).toHaveTextContent("later draft");
+  });
+
+  it("keeps both draft and queue entry when edit is blocked", async () => {
+    const user = userEvent.setup();
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+
+    await user.type(screen.getByLabelText("聊天输入"), "existing draft");
+    await user.click(screen.getByRole("button", { name: "编辑第 1 条待发送消息" }));
+
+    expect(await screen.findByText("输入框有内容，无法修改队列消息")).toBeVisible();
+    expect(screen.getByLabelText("聊天输入")).toHaveTextContent("existing draft");
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+  });
+
+  it("moves an editable queue entry back into an empty composer", async () => {
+    const user = userEvent.setup();
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "编辑第 1 条待发送消息" }));
+    expect(screen.getByLabelText("聊天输入")).toHaveTextContent("第一条");
+    expect(deleteQueuedMessage).toHaveBeenCalledWith("session-rewind", "queued-1", "session-rewind");
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("1");
+    expect(screen.getByRole("button", { name: "发送" })).toBeEnabled();
+  });
+
+  it("keeps the queue and composer unchanged when take-out fails", async () => {
+    vi.mocked(deleteQueuedMessage).mockRejectedValueOnce(new Error("queued_message_dispatched"));
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "编辑第 1 条待发送消息" }));
+    expect(await screen.findByText("queued_message_dispatched")).toBeVisible();
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+    expect(screen.getByLabelText("聊天输入")).toHaveTextContent("");
+    expect(screen.getByRole("button", { name: "编辑第 1 条待发送消息" })).toBeEnabled();
+  });
+
+  it("blocks duplicate actions and excludes the item from automatic sending while deleting", async () => {
+    let resolve!: () => void;
+    vi.mocked(deleteQueuedMessage).mockReturnValueOnce(new Promise<void>((done) => { resolve = done; }));
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={onRun} />);
+    const edit = screen.getByRole("button", { name: "编辑第 1 条待发送消息" });
+    fireEvent.click(edit);
+    fireEvent.click(edit);
+    expect(deleteQueuedMessage).toHaveBeenCalledTimes(1);
+    expect(edit).toBeDisabled();
+    expect(screen.getByRole("button", { name: "删除第 1 条待发送消息" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送第 1 条待发送消息" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    expect(onRun).not.toHaveBeenCalled();
+    await act(async () => resolve());
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0].queuedDelivery.messageIds).toEqual(["queued-2"]);
+    expect(screen.getByLabelText("聊天输入")).toHaveTextContent("第一条");
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("0");
+    expect(onRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("resubmits taken-out text and references as a new item at the tail", async () => {
+    vi.mocked(createQueuedMessage).mockImplementationOnce(async (threadId, id, content, references) => ({
+      thread_id: threadId, id, content, references: references ?? [], state: "pending", created_at: "now", updated_at: "now",
+    }));
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={onRun} />);
+    await userEvent.click(screen.getByRole("button", { name: "编辑第 1 条待发送消息" }));
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    const calls = vi.mocked(createQueuedMessage).mock.calls;
+    const args = calls[calls.length - 1];
+    expect(args[1]).not.toBe("queued-1");
+    expect(args[2]).toBe("第一条 @README.md");
+    expect(args[3]).toEqual([expect.objectContaining({ path: "C:/workspace/README.md" })]);
+    fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0].queuedDelivery.messageIds).toEqual(["queued-2", args[1]]);
+  });
+
+  it("takes out a failed unsaved item without a backend delete", async () => {
+    vi.mocked(createQueuedMessage).mockRejectedValueOnce(new Error("save failed"));
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText("聊天输入"), "unsaved");
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await userEvent.click(screen.getByRole("button", { name: "编辑第 3 条待发送消息" }));
+    expect(deleteQueuedMessage).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("聊天输入")).toHaveTextContent("unsaved");
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("2");
+  });
+
+  it("restores uploaded attachments when taking a message out", async () => {
+    vi.mocked(createQueuedMessage).mockImplementationOnce(async (threadId, id, content, references) => ({
+      thread_id: threadId, id, content, references: references ?? [], state: "pending", created_at: "now", updated_at: "now",
+    }));
+    render(<QueueHarness terminalStatus="success" onRun={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "编辑第 2 条待发送消息" }));
+    expect(screen.getByText("notes.txt", { exact: true })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    const calls = vi.mocked(createQueuedMessage).mock.calls;
+    expect(calls[calls.length - 1][3]).toEqual([
+      expect.objectContaining({ source: "project", path: "C:/workspace/README.md" }),
+      expect.objectContaining({ source: "upload", path: "C:/uploads/notes.txt" }),
+    ]);
+  });
+
+  it("sends a taken-out draft as a normal new Turn when no Turn is running", async () => {
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="paused" onRun={onRun} />);
+    fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    await userEvent.click(screen.getByRole("button", { name: "编辑第 1 条待发送消息" }));
+    await userEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun.mock.calls[0][0]).toEqual(expect.objectContaining({ prompt: "第一条 @README.md", resume: false }));
+    expect(onRun.mock.calls[0][0].queuedDelivery).toBeUndefined();
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("1");
+  });
+
+  it("creates a child Turn for a paused Turn with a draft", async () => {
+    const user = userEvent.setup();
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="paused" onRun={onRun} />);
+    await user.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    await user.type(screen.getByLabelText("聊天输入"), "new child input");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    expect(onRun).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: "new child input",
+      resume: false,
+      sourceNodeId: "turn-running",
+      waitForActiveRun: true,
+    }));
+  });
+
+  it("keeps items added during submission for the next Turn", async () => {
+    let releaseRun!: () => void;
+    const runGate = new Promise<void>((resolve) => { releaseRun = resolve; });
+    const onRun = vi.fn();
+    render(<QueueHarness terminalStatus="success" onRun={onRun} runGate={runGate} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "结束当前 Turn" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId("queued-count")).toHaveTextContent("0"));
+
+    fireEvent.click(screen.getByRole("button", { name: "提交期间新增队列项" }));
+    expect(screen.getByTestId("queued-count")).toHaveTextContent("1");
+    expect(onRun).toHaveBeenCalledTimes(1);
+
+    await act(async () => releaseRun());
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(2));
+    expect(onRun.mock.calls[1][0]).toEqual(expect.objectContaining({
+      prompt: null,
+      waitForActiveRun: true,
+      queuedDelivery: expect.objectContaining({ messageIds: ["queued-during-submit"] }),
+    }));
+  });
+});
+
+describe("ChatPage Trace navigation", () => {
+  function renderConversation(conversation: Conversation, agentThreadNavigation = false) {
+    return (
+      <AntApp>
+        <ChatPage
+          conversation={conversation}
+          agentThreadNavigation={agentThreadNavigation}
+          onUpdate={() => undefined}
+          onNew={async () => conversation.id}
+          onNavigate={() => undefined}
+          onEnsureSession={async () => conversation.sessionId!}
+          onRun={async () => undefined}
+        />
+      </AntApp>
+    );
+  }
+
+  it("hides the toolbar until the current Thread has an ordinary Turn", () => {
+    const empty: Conversation = {
+      id: "session-empty",
+      sessionId: "session-empty",
+      threadId: "session-empty",
+      title: "新对话",
+      runtimeNodes: [],
+      messagesLoaded: true,
+      messages: [],
+    };
+    const syntheticRoot: RuntimeRootNode = {
+      session_id: "session-empty",
+      thread_id: "session-empty",
+      id: "turn-synthetic-root",
+    };
+    const { rerender } = render(renderConversation(empty, true));
+
+    expect(screen.queryByRole("navigation", { name: "主内容视图" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("聊天输入")).toBeInTheDocument();
+
+    rerender(renderConversation({ ...empty, runtimeNodes: [syntheticRoot] }));
+    expect(screen.queryByRole("navigation", { name: "主内容视图" })).not.toBeInTheDocument();
+
+    const node = turn("turn-first", "first");
+    const populated = {
+      ...empty,
+      id: node.session_id,
+      sessionId: node.session_id,
+      threadId: node.thread_id,
+      runtimeNodes: [node],
+      activeTurnId: node.id,
+      lastNodeId: node.id,
+      messages: projectTurnPath(new Map([[`${node.session_id}:${node.id}`, node]]), node.id),
+    };
+    rerender(renderConversation(populated));
+
+    expect(screen.getByRole("navigation", { name: "主内容视图" })).toBeInTheDocument();
+    expect(screen.getByTitle(populated.title)).toHaveClass("chat-toolbar-title");
+    expect(screen.getByLabelText(node.thread_id)).toHaveClass("trace-toolbar-thread-id");
+  });
+
+  it("returns to Chat when switching from Trace to an empty conversation", async () => {
+    const populatedNode = turn("turn-populated", "populated");
+    const populated: Conversation = {
+      id: populatedNode.session_id,
+      sessionId: populatedNode.session_id,
+      threadId: populatedNode.thread_id,
+      title: "populated",
+      runtimeNodes: [populatedNode],
+      activeTurnId: populatedNode.id,
+      lastNodeId: populatedNode.id,
+      messagesLoaded: true,
+      messages: projectTurnPath(
+        new Map([[`${populatedNode.session_id}:${populatedNode.id}`, populatedNode]]),
+        populatedNode.id,
+      ),
+    };
+    const empty: Conversation = {
+      id: "session-empty",
+      sessionId: "session-empty",
+      threadId: "session-empty",
+      title: "新对话",
+      runtimeNodes: [],
+      messagesLoaded: true,
+      messages: [],
+    };
+    const { rerender } = render(renderConversation(populated));
+    fireEvent.click(screen.getByRole("button", { name: "Trace" }));
+    expect(screen.queryByLabelText("聊天输入")).not.toBeInTheDocument();
+
+    rerender(renderConversation(empty));
+    expect(screen.queryByRole("navigation", { name: "主内容视图" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("聊天输入")).toBeInTheDocument();
+
+    const firstNode = {
+      ...turn("turn-empty-first", "first"),
+      session_id: empty.sessionId!,
+      thread_id: empty.threadId!,
+    };
+    rerender(renderConversation({
+      ...empty,
+      runtimeNodes: [firstNode],
+      activeTurnId: firstNode.id,
+      lastNodeId: firstNode.id,
+      messages: projectTurnPath(new Map([[`${firstNode.session_id}:${firstNode.id}`, firstNode]]), firstNode.id),
+    }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute("aria-pressed", "true"));
+    expect(screen.getByLabelText("聊天输入")).toBeInTheDocument();
+  });
+
+  it("shows the text toolbar and hides the Composer in Trace view", async () => {
+    render(<Harness onRun={vi.fn()} onRewind={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Thread" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Chat" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Trace" }));
+
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    expect(screen.getByRole("textbox")).toBeInTheDocument();
+  });
+
+  it("opens Trace through /trace without dispatching a chat run", async () => {
+    const user = userEvent.setup();
+    const onRun = vi.fn();
+    render(<Harness onRun={onRun} onRewind={vi.fn()} />);
+
+    await user.type(screen.getByLabelText("聊天输入"), "/trace");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(onRun).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Trace" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("keeps the Thread dropdown scoped to the current thread", async () => {
+    const user = userEvent.setup();
+    render(<Harness onRun={vi.fn()} onRewind={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "Thread" }));
+
+    expect(await screen.findByRole("menuitem", { name: "session-rewind" })).toBeInTheDocument();
+    expect(screen.getAllByRole("menuitem")).toHaveLength(1);
+  });
+
+  it("switches the toolbar and runtime controls only below 700px", async () => {
+    const user = userEvent.setup();
+    const originalResizeObserver = window.ResizeObserver;
+    let chatResizeCallback: ResizeObserverCallback | undefined;
+    class MockResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe = (target: Element) => {
+        if (target.matches(".chat-page")) chatResizeCallback = this.callback;
+      };
+      unobserve() {}
+      disconnect() {}
+    }
+    window.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    vi.mocked(patchRuntimeConfig).mockImplementation(async (_sessionId, patch) => {
+      const accepted = turn("turn-config", "configure");
+      accepted.status = "running";
+      accepted.running_mode = patch.running_mode ?? "agent";
+      accepted.permission_mode = patch.permission_mode ?? "read_only";
+      accepted.model.reasoning_effort = (patch.model?.reasoning_effort as ReasoningEffort | undefined) ?? "medium";
+      return accepted;
+    });
+    const view = render(<ConfigHarness />);
+    try {
+      expect(CHAT_COMPACT_WIDTH).toBe(700);
+      expect(screen.getByRole("combobox", { name: "运行模式" })).toBeInTheDocument();
+
+      act(() => chatResizeCallback?.([
+        { contentRect: { width: 699 } } as ResizeObserverEntry,
+      ], {} as ResizeObserver));
+
+      expect(screen.queryByRole("combobox", { name: "运行模式" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Thread" }).querySelector(".anticon-branches")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Chat" }).querySelector(".anticon-comment")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Trace" }).querySelector(".anticon-node-index")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "运行模式：Agent" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "权限模式：只读" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "思考等级：中" })).toBeInTheDocument();
+
+      for (const [name, tooltip] of [
+        ["Thread", "Thread"],
+        ["Chat", "Chat"],
+        ["Trace", "Trace"],
+        ["运行模式：Agent", "运行模式：Agent"],
+        ["权限模式：只读", "权限模式：只读"],
+        ["思考等级：中", "思考等级：中"],
+      ] as const) {
+        const visibleTooltip = () => Array.from(document.querySelectorAll<HTMLElement>('[role="tooltip"]'))
+          .find((element) => !element.closest(".ant-tooltip")?.classList.contains("ant-tooltip-hidden"));
+        const button = screen.getByRole("button", { name });
+        await user.hover(button);
+        await waitFor(() => expect(visibleTooltip()).toHaveTextContent(tooltip));
+        await user.unhover(button);
+        await waitFor(() => expect(visibleTooltip()).toBeUndefined());
+      }
+
+      await user.click(screen.getByRole("button", { name: "运行模式：Agent" }));
+      expect(await screen.findByRole("menuitem", { name: "Agent" })).toHaveClass("ant-dropdown-menu-item-selected");
+      await user.click(screen.getByRole("menuitem", { name: "Plan" }));
+      await waitFor(() => expect(patchRuntimeConfig).toHaveBeenCalledWith(
+        "session-rewind",
+        expect.objectContaining({ running_mode: "plan" }),
+      ));
+
+      await user.click(screen.getByRole("button", { name: "权限模式：只读" }));
+      expect(await screen.findByRole("menuitem", { name: "只读" })).toHaveClass("ant-dropdown-menu-item-selected");
+      await user.click(screen.getByRole("menuitem", { name: "工作区读写" }));
+      await waitFor(() => expect(patchRuntimeConfig).toHaveBeenCalledWith(
+        "session-rewind",
+        expect.objectContaining({ permission_mode: "workspace_write" }),
+      ));
+
+      await user.click(screen.getByRole("button", { name: "思考等级：中" }));
+      expect(await screen.findByRole("menuitem", { name: "中（medium）" })).toHaveClass("ant-dropdown-menu-item-selected");
+      await user.click(screen.getByRole("menuitem", { name: "高（high）" }));
+      await waitFor(() => expect(patchRuntimeConfig).toHaveBeenCalledWith(
+        "session-rewind",
+        expect.objectContaining({ model: { reasoning_effort: "high" } }),
+      ));
+
+      act(() => chatResizeCallback?.([
+        { contentRect: { width: 700 } } as ResizeObserverEntry,
+      ], {} as ResizeObserver));
+
+      expect(screen.getByRole("combobox", { name: "运行模式" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Thread" })).toHaveTextContent("Thread");
+    } finally {
+      view.unmount();
+      window.ResizeObserver = originalResizeObserver;
+      vi.mocked(patchRuntimeConfig).mockReset();
+    }
+  });
+});
+
+describe("ChatPage Agent Thread navigation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getTurnPage).mockResolvedValue({ current_turn_id: null, turns: [], next_cursor: null, has_more: false });
+    vi.mocked(listAgentThreadChildren).mockImplementation(async (_sessionId, threadId) => (
+      threadId === "session-rewind"
+        ? [{
+            thread_id: "thread-child-agent",
+            thread_path: "/root/worker",
+            thread_status: "running",
+            task_result: "child task",
+          }]
+        : []
+    ));
+    vi.mocked(streamAgentThread).mockImplementation((_sessionId, _threadId, onEvent, signal) => {
+      onEvent({ type: "thread.ready", session_id: "session-rewind", thread_id: "thread-child-agent" });
+      return new Promise<"aborted">((resolve) => {
+        signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+      });
+    });
+    vi.mocked(sendAgentThreadMessage).mockResolvedValue({
+      delivery_id: "delivery-child",
+      accepted: true,
+      target_state: "running",
+      turn_id: "turn-child-agent",
+    });
+  });
+
+  async function selectChild(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("button", { name: "Thread" }));
+    const tree = await screen.findByRole("tree", { name: "Agent Thread 树" });
+    const root = within(tree).getByText("root").closest('[role="treeitem"]')!;
+    fireEvent.click(root.querySelector(".ant-tree-switcher")!);
+    await user.click(await within(tree).findByText("/root/worker · running"));
+    await waitFor(() => expect(streamAgentThread).toHaveBeenCalledTimes(1));
+  }
+
+  it("keeps Chat, Trace, and the send-only Composer on the selected Subagent", async () => {
+    const user = userEvent.setup();
+    const onRun = vi.fn();
+    render(<SubagentHarness onRun={onRun} />);
+    expect(screen.getByRole("button", { name: "暂停" })).toBeInTheDocument();
+
+    await selectChild(user);
+    expect(screen.getByRole("button", { name: "Thread" })).toHaveAttribute("aria-description", "thread-child-agent");
+    expect(screen.getByText("child task", { selector: "p" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "暂停" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "编辑" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("subagent-canonical-thread")).toHaveTextContent("session-rewind");
+    expect(screen.getByTestId("subagent-canonical-active")).toHaveTextContent("turn-root-agent");
+
+    await user.click(screen.getByRole("button", { name: "Trace" }));
+    expect(screen.getByRole("button", { name: "Thread" })).toHaveAttribute("aria-description", "thread-child-agent");
+    expect(screen.queryByLabelText("聊天输入")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Chat" }));
+
+    await user.type(screen.getByLabelText("聊天输入"), "follow up");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(sendAgentThreadMessage).toHaveBeenCalledWith(
+      "thread-child-agent",
+      expect.objectContaining({
+        sessionId: "session-rewind",
+        content: "follow up",
+      }),
+    ));
+    expect(onRun).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Thread" }));
+    await user.click(await screen.findByText("root"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "暂停" })).toBeInTheDocument());
+  });
+
+  it("keeps the toolbar available on a selected Subagent without a Turn", async () => {
+    const user = userEvent.setup();
+    render(<SubagentHarness includeChildTurn={false} />);
+
+    await selectChild(user);
+
+    expect(screen.getByRole("navigation", { name: "主内容视图" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Thread" })).toHaveAttribute("aria-description", "thread-child-agent");
+    expect(screen.getByLabelText("聊天输入")).toBeInTheDocument();
+  });
+
+  it("keeps the failed Subagent message outside the cleared composer", async () => {
+    vi.mocked(sendAgentThreadMessage).mockRejectedValueOnce(new Error("backend offline"));
+    const user = userEvent.setup();
+    render(<SubagentHarness />);
+    await selectChild(user);
+
+    const composer = screen.getByLabelText("聊天输入");
+    await user.type(composer, "keep this draft");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect((await screen.findAllByText("backend offline")).length).toBeGreaterThan(0);
+    expect(composer.textContent).toBe("");
+    expect(screen.getByText("keep this draft")).toBeVisible();
+    expect(screen.getByRole("button", { name: "重试发送" })).toBeVisible();
+  });
+
+  it("keeps the non-navigation Thread control from loading the Agent tree", async () => {
+    const user = userEvent.setup();
+    render(<Harness onRun={vi.fn()} onRewind={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "Thread" }));
+    expect(screen.queryByRole("tree", { name: "Agent Thread 树" })).not.toBeInTheDocument();
+    expect(listAgentThreadChildren).not.toHaveBeenCalled();
+  });
+});
+
+describe("ChatPage composer action matrix", () => {
+  it("allows an empty paused fork to continue without sending a new message", async () => {
+    const node = { ...turn("turn-paused-fork", "original task"), thread_id: "thread-fork", status: "paused" as const };
+    node.data[0][1].content = [];
+    const onRun = vi.fn();
+    const onFork = vi.fn();
+    const conversation: Conversation = {
+      id: "thread-fork", sessionId: node.session_id, threadId: node.thread_id, title: "fork",
+      runtimeNodes: [node], activeTurnId: node.id, lastNodeId: node.id, messagesLoaded: true,
+      messages: projectTurnPath(new Map([[`${node.session_id}:${node.id}`, node]]), node.id),
+    };
+    render(<AntApp><ChatPage
+      conversation={conversation} onUpdate={() => undefined} onNew={async () => conversation.id}
+      onNavigate={() => undefined} onRun={onRun} onFork={onFork}
+    /></AntApp>);
+    expect(await screen.findByRole("button", { name: "Fork" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Fork" }));
+    expect(onFork).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(onRun).toHaveBeenCalledWith(expect.objectContaining({
+      resume: true, sourceNodeId: node.id, prompt: null,
+    })));
+  });
+
+  it.each([
+    ["running", true, "send", false],
+    ["running", false, "pause", false],
+    ["paused", true, "send", false],
+    ["paused", false, "resume", false],
+    ["success", true, "send", false],
+    ["success", false, "send", true],
+    ["failed", true, "send", false],
+    ["failed", false, "send", true],
+    [undefined, true, "send", false],
+    [undefined, false, "send", true],
+  ] as const)("derives %s × draft=%s", (status, hasDraft, mode, disabled) => {
+    expect(composerAction(status, hasDraft)).toEqual({ mode, disabled });
+  });
+
+  it("disables every action while uploads are in progress", () => {
+    expect(composerAction("running", true, true)).toEqual({ mode: "send", disabled: true });
+    expect(composerAction("paused", false, true)).toEqual({ mode: "resume", disabled: true });
+  });
+});

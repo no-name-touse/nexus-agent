@@ -1,0 +1,99 @@
+import type { ProviderConfig } from "../../api";
+import type { QueuedMessage } from "../../app/types";
+import type {
+  ChatMode,
+  Conversation,
+  DisplayMode,
+  FileReference,
+  Page,
+  PermissionMode,
+  ReasoningEffort,
+  RuntimeNodeModel,
+  RuntimeStateNode,
+} from "../../types";
+import type { ComposerActionMode } from "./Composer";
+import type { SandboxHealthState } from "../../app/useSandboxHealth";
+
+export interface ChatPageProps {
+  active?: boolean;
+  showButtonTooltips?: boolean;
+  conversation: Conversation | null;
+  agentThreadNavigation?: boolean;
+  retainedConversationIds?: string[];
+  displayMode?: DisplayMode;
+  providerConfig?: ProviderConfig | null;
+  mode?: ChatMode;
+  onModeChange?: (mode: ChatMode) => void;
+  onUpdate: (id: string, updater: (conversation: Conversation) => Conversation) => void;
+  onNew: (title?: string) => Promise<string> | string;
+  onNavigate: (page: Page) => void;
+  onEnsureSession?: (id: string) => Promise<string>;
+  onFork?: (conversationId: string, messageId: string) => Promise<void>;
+  onRewind?: (conversationId: string, messageId: string) => Promise<RewindResult | string | undefined>;
+  onSelectSession?: (id: string) => Promise<string>;
+  onReload?: (id: string) => Promise<void>;
+  onRefresh?: () => Promise<void>;
+  onRun?: (request: ChatRunRequest) => Promise<void>;
+  onStopRun?: (turn: RuntimeStateNode) => void;
+  queuedMessages?: QueuedMessage[];
+  onQueuedMessagesChange?: (conversationId: string, updater: (items: QueuedMessage[]) => QueuedMessage[]) => void;
+  onQueuedMessagesRefresh?: (conversationId: string) => Promise<void>;
+  sandboxHealth?: Pick<SandboxHealthState, "phase" | "detail" | "error_report">;
+}
+
+export interface RewindResult {
+  content: string;
+  sessionId: string;
+  threadId?: string;
+  turnId?: string;
+  sourceNodeId?: string;
+  rewindTurnId?: string;
+}
+
+export interface PendingUpload {
+  uid: string;
+  name: string;
+  isImage: boolean;
+  status: "uploading" | "done" | "error";
+  percent: number;
+  file?: File;
+  path?: string;
+  displayPath?: string;
+  error?: string;
+}
+
+export interface ChatRunRequest {
+  conversationId: string;
+  sessionId: string;
+  threadId?: string;
+  turnId?: string;
+  prompt: string | null;
+  resume: boolean;
+  mode: ChatMode;
+  permissionMode: PermissionMode;
+  reasoningEffort: ReasoningEffort;
+  providerName?: string;
+  model?: RuntimeNodeModel;
+  sourceNodeId?: string;
+  rewindTurnId?: string;
+  references?: FileReference[];
+  waitForActiveRun?: boolean;
+  onBaseline?: (turn: RuntimeStateNode) => void;
+  queuedDelivery?: { messageIds: string[] };
+  onAccepted?: (turn?: RuntimeStateNode) => void;
+  onAdmissionRejected?: () => void;
+}
+
+export function composerAction(
+  status: RuntimeStateNode["status"] | undefined,
+  hasDraft: boolean,
+  uploading = false,
+  hasQueuedInput = false,
+): { mode: ComposerActionMode; disabled: boolean } {
+  const mode: ComposerActionMode = status === "running" && !hasDraft
+    ? hasQueuedInput ? "steer" : "pause"
+    : status === "paused" && !hasDraft
+      ? "resume"
+      : "send";
+  return { mode, disabled: uploading || (mode === "send" && !hasDraft) };
+}

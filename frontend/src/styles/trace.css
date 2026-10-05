@@ -1,0 +1,312 @@
+.chat-page {
+  position: relative;
+}
+
+.trace-toolbar {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  margin: 0 auto;
+  gap: 12px;
+  min-height: 56px;
+  padding: 8px var(--chat-gutter);
+  padding-right: 56px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.chat-toolbar-actions {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 75%;
+  align-items: center;
+  gap: 2px;
+}
+
+.trace-toolbar .ant-btn {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+}
+
+.trace-toolbar .ant-btn[aria-pressed="true"] {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chat-page--compact .trace-toolbar {
+  gap: 8px;
+}
+
+.chat-page--compact .trace-toolbar .ant-btn {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+}
+
+.chat-toolbar-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-shell--sidebar-collapsed .trace-toolbar {
+  padding-left: 60px;
+}
+
+.agent-thread-popover {
+  width: 320px;
+  max-width: calc(100vw - 24px);
+}
+
+.agent-thread-tree {
+  width: 100%;
+  min-width: 0;
+  max-height: 360px;
+  overflow: auto;
+  color: var(--text);
+  background: var(--surface);
+}
+
+.agent-thread-tree .ant-tree-treenode {
+  min-width: 0;
+  min-height: 32px;
+  align-items: center;
+}
+
+.agent-thread-tree .ant-tree-node-content-wrapper {
+  min-width: 0;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border-radius: 6px;
+}
+
+.agent-thread-tree .ant-tree-title,
+.thread-node-label {
+  display: block;
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.agent-thread-tree .ant-tree-node-content-wrapper:hover {
+  background: var(--hover);
+}
+
+.agent-thread-tree .ant-tree-node-content-wrapper.ant-tree-node-selected {
+  background: var(--selected);
+  color: var(--text);
+}
+
+.thread-scroll {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.thread-scroll-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: translateX(0);
+}
+
+.trace-toolbar-thread-id {
+  flex: 0 1 200px;
+  max-width: 200px;
+  color: var(--muted);
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.chat-page--compact .trace-toolbar-thread-id {
+  flex-basis: 88px;
+  max-width: 88px;
+}
+
+.thread-scroll--overflow:hover .thread-scroll-text,
+.thread-scroll--overflow:focus .thread-scroll-text,
+.agent-thread-tree:focus-within .ant-tree-treenode-active .thread-scroll--overflow .thread-scroll-text {
+  width: max-content;
+  overflow: visible;
+  text-overflow: clip;
+  animation: thread-text-scroll var(--thread-scroll-duration) ease-in-out 350ms infinite;
+}
+
+@keyframes thread-text-scroll {
+  0%, 12%, 100% { transform: translateX(0); }
+  58%, 82% { transform: translateX(var(--thread-scroll-distance)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-scroll--overflow:hover .thread-scroll-text,
+  .thread-scroll--overflow:focus .thread-scroll-text,
+  .agent-thread-tree:focus-within .ant-tree-treenode-active .thread-scroll--overflow .thread-scroll-text {
+    width: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    animation: none;
+  }
+}
+
+.trace-page {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 24px 32px;
+  background: var(--surface-subtle);
+}
+
+.trace-download-actions {
+  display: flex;
+  justify-content: flex-end;
+  max-width: 1100px;
+  margin: 0 auto 12px;
+}
+
+.trace-version-controls,
+.trace-turn-label,
+.trace-collapse-label {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.trace-version-controls {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.trace-version-controls .ant-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+
+.trace-version-label {
+  white-space: nowrap;
+}
+
+.trace-turn-collapse {
+  max-width: 1100px;
+  margin: 0 auto;
+  background: var(--surface);
+}
+
+.trace-turn-collapse > .ant-collapse-item > .ant-collapse-header {
+  min-width: 0;
+}
+
+.trace-turn-collapse > .ant-collapse-item > .ant-collapse-header > .ant-collapse-extra {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.trace-turn-label,
+.trace-collapse-label {
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.trace-collapse-title {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.trace-turn-id {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-turn-label .ant-tag,
+.trace-collapse-label .ant-tag {
+  flex: 0 0 auto;
+}
+
+.trace-turn-label time,
+.trace-collapse-label time {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trace-preview {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.trace-value {
+  max-height: 480px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.trace-inner-collapse {
+  background: transparent;
+}
+
+.trace-parallel-inner-collapse {
+  background: transparent;
+  border-inline-start: 1px solid var(--border);
+}
+
+.trace-turn-content {
+  min-width: 0;
+}
+
+.trace-turn-content > .ant-alert {
+  margin-bottom: 12px;
+}
+
+.trace-loading {
+  display: flex;
+  justify-content: center;
+  padding: 32px;
+}
+
+@media (max-width: 700px) {
+  .trace-page {
+    padding: 10px 10px 20px;
+  }
+
+  .trace-version-prefix {
+    display: none;
+  }
+
+  .trace-turn-label time,
+  .trace-collapse-label time {
+    display: none;
+  }
+}

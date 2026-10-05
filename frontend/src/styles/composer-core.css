@@ -1,0 +1,186 @@
+/* ---------- Input composer (one unified box) ---------- */
+.composer {
+  position: relative;
+  max-width: var(--chat-content-width);
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 var(--chat-gutter) 16px;
+}
+.composer-box {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.composer-box:focus-within {
+  border-color: var(--accent);
+}
+
+.composer textarea,
+.composer .file-mention-editor {
+  width: 100%;
+  border: none;
+  padding: 14px 16px;
+  font-size: 15px;
+  font-family: inherit;
+  resize: none;
+  outline: none;
+  background: transparent;
+  line-height: 1.5;
+  overflow-y: auto;
+  display: block;
+}
+
+.composer .file-mention-editor {
+  min-height: 48px;
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.composer .file-mention-editor p {
+  margin: 0;
+}
+
+.file-mention-bubble {
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin: 0 2px;
+  padding: 1px 5px 1px 7px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.94em;
+  line-height: 1.35;
+  vertical-align: baseline;
+}
+
+.file-mention-bubble.upload {
+  border-color: var(--info-border);
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.file-mention-label {
+  min-width: 0;
+  max-width: min(32ch, 55vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-mention-remove {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: currentColor;
+  cursor: pointer;
+  font: inherit;
+  line-height: 14px;
+}
+
+.file-mention-remove:hover {
+  background: var(--shadow);
+}
+
+.composer-box .send-btn {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease, opacity 160ms ease;
+}
+
+.composer-box .send-btn:hover:not(:disabled) {
+  background: var(--accent-dark);
+  color: var(--on-accent);
+}
+
+.composer-box .send-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.composer-box .send-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.composer-box .send-btn.stop {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.composer-box .send-btn.stop:hover:not(:disabled) {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.composer-toolbar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-height: 48px;
+  padding: 0 54px 12px 12px;
+  z-index: 2;
+}
+
+.question-options small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.composer-hint {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.queued-message-list {
+  margin: 0 5px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.queued-message-header { margin-bottom: 5px; color: var(--muted); font-size: 12px; }
+.queued-message-list ol { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.queued-message-item { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; }
+.queued-message-index { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.queued-message-content { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queued-message-actions { display: inline-flex; flex: 0 0 auto; gap: 2px; }
+.queued-message-button {
+  display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
+  padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer;
+}
+.queued-message-button:hover, .queued-message-button:focus-visible { background: var(--accent-soft); color: var(--accent-dark); }
+.queued-message-button.danger:hover, .queued-message-button.danger:focus-visible { background: var(--error-bg); color: var(--error); }

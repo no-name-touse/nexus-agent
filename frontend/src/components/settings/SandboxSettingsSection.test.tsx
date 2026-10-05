@@ -1,0 +1,92 @@
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SandboxAutoRecoveryPhase } from "../../app/useSandboxHealth";
+import type { UserSettingsState } from "./useUserSettingsState";
+import { brokerErrorTitle, SandboxSettingsSection } from "./SandboxSettingsSection";
+
+vi.mock("../../api/settings", () => ({
+  getSandboxResources: vi.fn().mockResolvedValue({
+    usage: { memory_bytes: 0, processes: 0, handles: 0 },
+    limits: { memory_mib: 8192, processes: 512, handles: 32768 }, queued: 0,
+  }),
+}));
+
+function makeState(
+  phase: "healthy" | "unhealthy" = "healthy",
+  autoRecoveryPhase: SandboxAutoRecoveryPhase = "idle",
+  nextRetryAt: number | null = null,
+): UserSettingsState {
+  return {
+    settings: {
+      sandbox_config: {
+        network_mode: "no_network",
+        network_allowlist: [],
+        proxy_port: 17831,
+        limits: {
+          wall_seconds: 30,
+          cpu_seconds: 30,
+          memory_mib: 512,
+          processes: 16,
+          handles: 1024,
+          output_chars: 20000,
+          write_io_mib: 0,
+        },
+      },
+    },
+    sandboxHealth: {
+      phase,
+      installed: true,
+      code: phase === "healthy" ? null : "broker_unhealthy",
+      detail: phase === "healthy" ? null : "unhealthy",
+      checking: false,
+      autoRecoveryPhase,
+      nextRetryAt,
+      check: vi.fn().mockResolvedValue({ installed: true, healthy: phase === "healthy" }),
+      notifyUserBackendRequest: vi.fn(),
+    },
+    updateSettings: vi.fn(),
+  } as unknown as UserSettingsState;
+}
+
+describe("brokerErrorTitle", () => {
+  afterEach(() => cleanup());
+
+  it.each([
+    ["broker_not_installed", "沙箱 Broker 未安装"],
+    ["broker_service_configuration_invalid", "Broker 服务配置异常"],
+    ["broker_ready_marker_unavailable", "Broker 就绪信息缺失"],
+    ["broker_pipe_unavailable", "Broker 通信失败"],
+    ["broker_protocol_incompatible", "Broker 协议版本不兼容"],
+    ["broker_service_start_failed", "Broker Windows 服务启动失败"],
+    ["broker_admin_required", "Broker 修复需要管理员权限"],
+    ["broker_jobs_active", "仍有沙箱命令运行"],
+  ])("maps %s to a distinct title", (code, title) => {
+    expect(brokerErrorTitle(code, true)).toBe(title);
+  });
+
+  it("uses stable fallbacks for unknown and missing codes", () => {
+    expect(brokerErrorTitle("future_broker_failure", true)).toBe("沙箱 Broker 异常");
+    expect(brokerErrorTitle(null, false)).toBe("沙箱 Broker 未安装");
+  });
+
+  it("shows automatic recovery states", () => {
+    const { rerender } = render(<SandboxSettingsSection state={makeState("unhealthy", "repairing")} />);
+    expect(screen.queryByRole("button", { name: "修复" })).not.toBeInTheDocument();
+    expect(screen.getByText("正在恢复沙箱")).toBeInTheDocument();
+
+    rerender(<SandboxSettingsSection state={makeState("unhealthy", "observing", Date.now() + 5_000)} />);
+    expect(screen.getByText("5 秒后自动恢复")).toBeInTheDocument();
+
+    rerender(<SandboxSettingsSection state={makeState("unhealthy", "verifying", Date.now() + 5_000)} />);
+    expect(screen.getByText("正在验证恢复，剩余 5 秒")).toBeInTheDocument();
+
+    rerender(<SandboxSettingsSection state={makeState("unhealthy", "paused")} />);
+    expect(screen.getByText("自动恢复已暂停")).toBeInTheDocument();
+  });
+
+  it.each(["healthy", "unhealthy"] as const)("has no manual check or overwrite repair while %s", (phase) => {
+    render(<SandboxSettingsSection state={makeState(phase)} />);
+    expect(screen.queryByRole("button", { name: /检\s*查/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "覆盖修复" })).not.toBeInTheDocument();
+  });
+});

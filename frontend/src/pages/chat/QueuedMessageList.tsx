@@ -1,0 +1,44 @@
+import { DeleteOutlined, EditOutlined, SendOutlined } from "@ant-design/icons";
+import type { QueuedMessage } from "../../app/types";
+
+interface Props {
+  items: QueuedMessage[];
+  onSend: (item: QueuedMessage) => void;
+  onEdit: (item: QueuedMessage) => void;
+  onDelete: (item: QueuedMessage) => void;
+  disabled?: boolean;
+  sendDisabled?: boolean;
+}
+
+export default function QueuedMessageList({ items, onSend, onEdit, onDelete, disabled = false, sendDisabled = false }: Props) {
+  if (items.length === 0) return null;
+  return (
+    <section className="queued-message-list" aria-label="待发送消息">
+      <div className="queued-message-header">待发送 {items.length} 条</div>
+      <ol>
+        {items.map((item, index) => (
+          <li key={item.id} className="queued-message-item">
+            <span className="queued-message-index" aria-hidden="true">{index + 1}</span>
+            <span className="queued-message-content">
+              {item.content || "（仅文件）"}
+              {item.state === "dispatched" ? <span className="queued-message-sending"> · 发送中</span> : null}
+              {item.saving ? <span className="queued-message-sending"> · 保存中</span> : null}
+              {item.error ? <span role="alert"> · {item.error}</span> : null}
+            </span>
+            <span className="queued-message-actions">
+              <button type="button" className="queued-message-button" title={item.error ? "重试" : "追加指令"} aria-label={`${item.error ? "重试" : "发送"}第 ${index + 1} 条待发送消息`} disabled={disabled || sendDisabled || item.saving || item.state === "dispatched"} onClick={() => onSend(item)}>
+                <SendOutlined aria-hidden="true" />
+              </button>
+              <button type="button" className="queued-message-button" aria-label={`编辑第 ${index + 1} 条待发送消息`} disabled={disabled || item.saving || item.state === "dispatched"} onClick={() => onEdit(item)}>
+                <EditOutlined aria-hidden="true" />
+              </button>
+              <button type="button" className="queued-message-button danger" aria-label={`删除第 ${index + 1} 条待发送消息`} disabled={disabled || item.saving || item.state === "dispatched"} onClick={() => onDelete(item)}>
+                <DeleteOutlined aria-hidden="true" />
+              </button>
+            </span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}

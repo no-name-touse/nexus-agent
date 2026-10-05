@@ -1,0 +1,201 @@
+"""Conversion from provider-neutral chat messages to Chat Completions wire messages."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from backend.domain import (
+    AssistantMessage,
+    ChatMessage,
+    DeveloperMessage,
+    SystemMessage,
+    ToolMessage,
+    ToolSpec,
+    UserMessage,
+)
+from backend.runtime.core.context import AgentRuntime
+
+from ..errors import ModelRequestError
+from .common import _TOOL_NAME, _merge_extra_fields, _provider_options
+
+
+def _optional_name(message: SystemMessage | UserMessage | AssistantMessage) -> dict[str, str]:
+    if not isinstance(message.name, str) or not message.name:
+        raise ModelRequestError("Chat Completions message name must be a non-empty string.")
+    return {"name": message.name} if message.name != message.role else {}
+
+
+def _tool_definition(spec: ToolSpec) -> dict[str, Any]:
+    if not _TOOL_NAME.fullmatch(spec.name):
+        raise ModelRequestError(
+            f"Chat Completions tool name {spec.name!r} must contain 1-64 letters, digits, underscores, or hyphens."
+        )
+    if not isinstance(spec.description, str):
+        raise ModelRequestError(f"Chat Completions tool {spec.name!r} description must be text.")
+    if not isinstance(spec.parameters, dict):
+        raise ModelRequestError(f"Chat Completions tool {spec.name!r} parameters must be a JSON Schema object.")
+    function: dict[str, Any] = {"name": spec.name, "description": spec.description}
+    if spec.parameters:
+        function["parameters"] = spec.parameters
+    options = _provider_options(spec)
+    unknown = set(options) - {"strict", "extra_body"}
+    if unknown:
+        raise ModelRequestError(f"Unknown Chat Completions tool option(s): {', '.join(sorted(unknown))}.")
+    if "strict" in options:
+        if not isinstance(options["strict"], bool):
+            raise ModelRequestError(f"Chat Completions tool {spec.name!r} strict must be boolean.")
+        function["strict"] = options["strict"]
+    _merge_extra_fields(
+        function,
+        options.get("extra_body"),
+        protected={"name", "description", "parameters", "strict"},
+        label=f"tool {spec.name!r}",
+    )
+    return {"type": "function", "function": function}
+
+
+def _wire_messages_from(source: list[ChatMessage]) -> list[dict[str, Any]]:
+    if not source:
+        raise ModelRequestError("Chat Completions messages must contain at least one message.")
+    wire: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    completed_tools: dict[str, ToolMessage] = {}
+    for item in source:
+        if not isinstance(item, AssistantMessage):
+            continue
+        for tool in item.tool_messages:
+            if tool.call_id and tool.status != "pending" and tool.content is not None:
+                completed_tools[tool.call_id] = tool
+    for position, message in enumerate(source):
+        if isinstance(message, DeveloperMessage):
+            message = UserMessage(content=message.content, provider_options=message.provider_options)
+        if isinstance(message, SystemMessage):
+            options = _provider_options(message)
+            unknown = set(options) - {"extra_body"}
+            if unknown:
+                raise ModelRequestError(
+                    f"Unknown Chat Completions system message option(s): {', '.join(sorted(unknown))}."
+                )
+            item: dict[str, Any] = {"role": "system", "content": message.content or ""}
+            item.update(_optional_name(message))
+            _merge_extra_fields(
+                item,
+                options.get("extra_body"),
+                protected={"role", "content", "name"},
+                label="system message",
+            )
+            wire.append(item)
+            continue
+        if isinstance(message, UserMessage):
+            options = _provider_options(message)
+            unknown = set(options) - {"extra_body"}
+            if unknown:
+                raise ModelRequestError(
+                    f"Unknown Chat Completions user message option(s): {', '.join(sorted(unknown))}."
+                )
+            item = {"role": "user", "content": message.content or ""}
+            item.update(_optional_name(message))
+            _merge_extra_fields(
+                item,
+                options.get("extra_body"),
+                protected={"role", "content", "name"},
+                label="user message",
+            )
+            wire.append(item)
+            continue
+        if not isinstance(message, AssistantMessage):
+            raise ModelRequestError(f"Unsupported internal message type: {type(message).__name__}.")
+        options = _provider_options(message)
+        unknown = set(options) - {"prefix", "extra_body", "response"}
+        if unknown:
+            raise ModelRequestError(
+                f"Unknown Chat Completions assistant message option(s): {', '.join(sorted(unknown))}."
+            )
+        prefix = options.get("prefix")
+        if prefix is not None and not isinstance(prefix, bool):
+            raise ModelRequestError("Chat Completions assistant prefix must be boolean.")
+        if prefix and position != len(source) - 1:
+            raise ModelRequestError("Chat Completions assistant prefix is only valid on the last input message.")
+        if not message.tool_messages:
+            # Runtime history may contain an in-flight placeholder or a
+            # reasoning/control-only assistant node.  Those are valid inside
+            # Praxis, but OpenAI-compatible providers require assistant
+            # messages to contain either visible content or tool_calls.
+            # Omitting the non-wire turn preserves the surrounding history
+            # without inventing user-visible text.
+            if not isinstance(message.content, str) or not message.content.strip():
+                if prefix:
+                    raise ModelRequestError("Chat Completions assistant prefix requires non-empty content.")
+                continue
+            assistant: dict[str, Any] = {"role": "assistant", "content": message.content}
+            assistant.update(_optional_name(message))
+            if "prefix" in options:
+                assistant["prefix"] = prefix
+            if prefix and message.reasoning is not None:
+                assistant["reasoning_content"] = message.reasoning
+            _merge_extra_fields(
+                assistant,
+                options.get("extra_body"),
+                protected={"role", "content", "name", "prefix", "reasoning_content", "tool_calls"},
+                label="assistant message",
+            )
+            wire.append(assistant)
+            continue
+
+        tool_calls: list[dict[str, Any]] = []
+        emitted_tools: list[ToolMessage] = []
+        for tool in message.tool_messages:
+            if tool.call_id in seen_call_ids:
+                # A recovered canonical path may contain the same call on a
+                # later assistant node.  The first declaration is retained;
+                # its result is resolved from the complete history above.
+                continue
+            seen_call_ids.add(tool.call_id)
+            effective = tool
+            completed = completed_tools.get(tool.call_id)
+            if (tool.status == "pending" or tool.content is None) and completed is not None:
+                effective = completed
+            if effective.status == "pending" or effective.content is None:
+                raise ModelRequestError(
+                    f"Tool call {tool.call_id} has no result and cannot be sent to Chat Completions."
+                )
+            emitted_tools.append(effective)
+            tool_calls.append(
+                {
+                    "id": effective.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": effective.name,
+                        "arguments": json.dumps(effective.arguments, ensure_ascii=False, separators=(",", ":")),
+                    },
+                }
+            )
+        if not emitted_tools:
+            if not isinstance(message.content, str) or not message.content.strip():
+                continue
+            wire.append({"role": "assistant", "content": message.content})
+            continue
+        assistant: dict[str, Any] = {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": tool_calls,
+        }
+        assistant.update(_optional_name(message))
+        if message.reasoning is not None:
+            assistant["reasoning_content"] = message.reasoning
+        if "prefix" in options:
+            assistant["prefix"] = prefix
+        _merge_extra_fields(
+            assistant,
+            options.get("extra_body"),
+            protected={"role", "content", "name", "prefix", "reasoning_content", "tool_calls"},
+            label="assistant message",
+        )
+        wire.append(assistant)
+        wire.extend({"role": "tool", "tool_call_id": tool.call_id, "content": tool.content} for tool in emitted_tools)
+    return wire
+
+
+def _wire_messages(runtime: AgentRuntime) -> list[dict[str, Any]]:
+    return _wire_messages_from(runtime.exchange.messages or runtime.state.messages)

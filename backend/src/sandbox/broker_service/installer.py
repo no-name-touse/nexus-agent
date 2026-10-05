@@ -1,0 +1,754 @@
+"""Windows service install/repair transaction and process adapter contract."""
+
+from __future__ import annotations
+
+import base64
+import ctypes
+import filecmp
+import json
+import logging
+import ntpath
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import uuid
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any, Protocol
+
+from backend.domain import redact_sensitive_text
+
+from ..errors import BrokerInstallationError, BrokerInstallFailureCode, SandboxInitializationError
+from ..runtime.manifest import ResourceRecord
+
+logger = logging.getLogger(__name__)
+
+_MAX_DIAGNOSTIC_VALUE_LENGTH = 240
+
+
+def _absolute_windows_path(value: str | os.PathLike[str]) -> str:
+    """Return one lexical absolute spelling for a Windows path."""
+
+    raw = os.fspath(value).replace("/", "\\")
+    folded = raw.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        raw = f"\\\\{raw[8:]}"
+    elif folded.startswith("\\??\\unc\\"):
+        raw = f"\\\\{raw[8:]}"
+    elif folded.startswith("\\\\?\\"):
+        raw = raw[4:]
+    elif folded.startswith("\\??\\"):
+        raw = raw[4:]
+    return ntpath.abspath(ntpath.normpath(raw))
+
+
+def _normalized_windows_path(value: str | os.PathLike[str]) -> str:
+    return ntpath.normcase(_absolute_windows_path(value))
+
+
+def _windows_command_line_argv(command: str) -> tuple[str, ...]:
+    """Parse an SCM command line using the Windows command-line parser."""
+
+    if os.name != "nt":
+        raise OSError("Windows command-line parsing is unavailable")
+    argc = ctypes.c_int()
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = command_line_to_argv(command, ctypes.byref(argc))
+    if not argv:
+        raise ctypes.WinError()
+    try:
+        return tuple(argv[index] for index in range(argc.value))
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
+
+
+def _service_command_check(
+    actual_command: str,
+    expected_command: tuple[str, ...],
+) -> tuple[str | None, tuple[str, ...]]:
+    actual = _windows_command_line_argv(actual_command)
+    if not actual or not expected_command:
+        return "service_command", actual
+    if _normalized_windows_path(actual[0]) != _normalized_windows_path(expected_command[0]):
+        return "service_executable", actual
+    if actual[1:] != expected_command[1:]:
+        return "service_arguments", actual
+    return None, actual
+
+
+def _split_service_class(value: str) -> tuple[str, str] | None:
+    separator = max(value.rfind("\\"), value.rfind("/"))
+    if separator < 0:
+        return None
+    return value[:separator], value[separator + 1 :]
+
+
+def _service_class_matches(actual: str, expected: str) -> bool:
+    if actual == expected:
+        return True
+    actual_parts = _split_service_class(actual)
+    expected_parts = _split_service_class(expected)
+    if actual_parts is None or expected_parts is None:
+        return False
+    actual_directory, actual_entrypoint = actual_parts
+    expected_directory, expected_entrypoint = expected_parts
+    return actual_entrypoint == expected_entrypoint and _normalized_windows_path(
+        actual_directory
+    ) == _normalized_windows_path(expected_directory)
+
+
+def _diagnostic_value(value: object) -> str:
+    text = redact_sensitive_text(str(value)).replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) <= _MAX_DIAGNOSTIC_VALUE_LENGTH:
+        return text
+    return f"{text[: _MAX_DIAGNOSTIC_VALUE_LENGTH - 3]}..."
+
+
+def _diagnostic_path(value: object) -> str:
+    try:
+        return _diagnostic_value(_absolute_windows_path(str(value)))
+    except Exception:
+        return _diagnostic_value(value)
+
+
+def _elevated_helper_argv(encoded_payload: str, source_root: Path | None) -> tuple[str, ...]:
+    if source_root is None:
+        return ("-m", "backend.sandbox.install_helper", encoded_payload)
+    source_literal = json.dumps(str(source_root))
+    bootstrap = (
+        "import importlib.util,os,sys;"
+        f"_p={source_literal};"
+        "_s=importlib.util.spec_from_file_location("
+        "'backend',os.path.join(_p,'__init__.py'),submodule_search_locations=[_p]);"
+        "_m=importlib.util.module_from_spec(_s);"
+        "sys.modules['backend']=_m;"
+        "_s.loader.exec_module(_m);"
+        "from backend.sandbox.install_helper import main;"
+        "raise SystemExit(main())"
+    )
+    return ("-c", bootstrap, encoded_payload)
+
+
+class BrokerProcessAdapter(Protocol):
+    def reserve(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def launch(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def control(self, operation: str, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def release(self, request: Mapping[str, Any]) -> bool: ...
+
+    def reclaim(self, request: Mapping[str, Any]) -> tuple[str, ...]: ...
+
+    def recover(self, record: ResourceRecord) -> bool: ...
+
+
+class WindowsServiceInstaller:
+    """Install/repair the Broker as a virtual-account Windows service."""
+
+    def __init__(
+        self,
+        service_command: tuple[str, ...],
+        *,
+        service_name: str = "PraxisSandboxBroker",
+        service_class: str | None = None,
+        runner: Callable[..., Any] | None = None,
+        is_windows: bool | None = None,
+        backend_sid_path: Path | None = None,
+        program_data_path: Path | None = None,
+        service_code_path: Path | None = None,
+        service_code_boundary_path: Path | None = None,
+        service_runtime_paths: tuple[Path, ...] = (),
+        proxy_port: int = 17831,
+    ) -> None:
+        if not service_command or any(not isinstance(item, str) or not item for item in service_command):
+            raise ValueError("service_command must contain non-empty strings")
+        self.service_command = service_command
+        self.service_name = service_name
+        self.service_class = service_class
+        self._runner_injected = runner is not None
+        self.runner = runner or subprocess.run
+        self.is_windows = os.name == "nt" if is_windows is None else is_windows
+        self.backend_sid_path = Path(backend_sid_path) if backend_sid_path is not None else None
+        self.program_data_path = Path(program_data_path) if program_data_path is not None else None
+        self.service_code_path = Path(service_code_path) if service_code_path is not None else None
+        self.service_code_boundary_path = (
+            Path(service_code_boundary_path) if service_code_boundary_path is not None else None
+        )
+        self.service_runtime_paths = tuple(Path(path) for path in service_runtime_paths)
+        if (self.service_code_path is None) != (self.service_code_boundary_path is None):
+            raise ValueError("service_code_path and service_code_boundary_path must be provided together")
+        if any(not path.is_absolute() or len(path.parts) < 3 for path in self.service_runtime_paths):
+            raise ValueError("service_runtime_paths must contain safe absolute paths")
+        if isinstance(proxy_port, bool) or not isinstance(proxy_port, int) or not 1 <= proxy_port <= 65535:
+            raise ValueError("proxy_port must be between 1 and 65535")
+        self.proxy_port = proxy_port
+        self._configuration_diagnostic_lock = threading.Lock()
+        self._last_configuration_failure: tuple[str, object] | None = None
+
+    def install(self) -> None:
+        self._require_windows()
+        self._run_transaction("install")
+
+    def repair(self) -> None:
+        self._require_windows()
+        query = self.runner(["sc.exe", "query", self.service_name], check=False, capture_output=True)
+        if getattr(query, "returncode", 1) != 0:
+            self._run_transaction("install")
+            return
+
+        self._run_transaction("repair")
+
+    def configuration_healthy(self) -> bool:
+        """Verify the unprivileged, non-secret SCM configuration summary."""
+
+        if not self.is_windows:
+            return False
+        manager = None
+        service = None
+        win32service = None
+        step = "import_dependencies"
+        try:
+            import winreg
+
+            import win32service as win32service_module  # type: ignore[import-not-found]
+
+            win32service = win32service_module
+            step = "open_service_manager"
+            manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+            step = "open_service"
+            service = win32service.OpenService(manager, self.service_name, win32service.SERVICE_QUERY_CONFIG)
+            step = "query_service_config"
+            config = win32service.QueryServiceConfig(service)
+            step = "query_service_sid"
+            sid_type = win32service.QueryServiceConfig2(service, win32service.SERVICE_CONFIG_SERVICE_SID_INFO)
+            if int(config[0]) != win32service.SERVICE_WIN32_OWN_PROCESS:
+                return self._configuration_failure(
+                    "service_type",
+                    expected=win32service.SERVICE_WIN32_OWN_PROCESS,
+                    actual=config[0],
+                )
+            if int(config[1]) != win32service.SERVICE_DEMAND_START:
+                return self._configuration_failure(
+                    "start_type",
+                    expected=win32service.SERVICE_DEMAND_START,
+                    actual=config[1],
+                )
+            step = "parse_service_command"
+            command_mismatch, actual_command = _service_command_check(str(config[3]), self.service_command)
+            if command_mismatch == "service_command":
+                return self._configuration_failure(command_mismatch)
+            if command_mismatch == "service_executable":
+                return self._configuration_failure(
+                    command_mismatch,
+                    expected=_diagnostic_path(self.service_command[0]),
+                    actual=_diagnostic_path(actual_command[0]),
+                )
+            if command_mismatch == "service_arguments":
+                return self._configuration_failure(
+                    command_mismatch,
+                    _identity=actual_command[1:],
+                    expected_count=max(0, len(self.service_command) - 1),
+                    actual_count=max(0, len(actual_command) - 1),
+                )
+            expected_account = f"NT SERVICE\\{self.service_name}"
+            if str(config[7]).casefold() != expected_account.casefold():
+                return self._configuration_failure(
+                    "service_account",
+                    expected=expected_account,
+                    actual=config[7],
+                )
+            if int(sid_type) != win32service.SERVICE_SID_TYPE_UNRESTRICTED:
+                return self._configuration_failure(
+                    "service_sid_type",
+                    expected=win32service.SERVICE_SID_TYPE_UNRESTRICTED,
+                    actual=sid_type,
+                )
+            if self.service_class is None:
+                self._configuration_recovered()
+                return True
+            key_path = rf"SYSTEM\CurrentControlSet\Services\{self.service_name}\PythonClass"
+            step = "read_python_class"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_READ) as key:
+                value, value_type = winreg.QueryValueEx(key, "")
+            if value_type != winreg.REG_SZ:
+                return self._configuration_failure(
+                    "python_class_type",
+                    expected=winreg.REG_SZ,
+                    actual=value_type,
+                )
+            if not isinstance(value, str) or not _service_class_matches(value, self.service_class):
+                actual_parts = _split_service_class(value) if isinstance(value, str) else None
+                expected_parts = _split_service_class(self.service_class)
+                return self._configuration_failure(
+                    "python_class",
+                    expected_directory=(
+                        _diagnostic_path(expected_parts[0]) if expected_parts is not None else "<module>"
+                    ),
+                    actual_directory=(_diagnostic_path(actual_parts[0]) if actual_parts is not None else "<module>"),
+                    expected_entrypoint=(expected_parts[1] if expected_parts is not None else self.service_class),
+                    actual_entrypoint=(actual_parts[1] if actual_parts is not None else value),
+                )
+            self._configuration_recovered()
+            return True
+        except Exception as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror is None and getattr(exc, "args", None):
+                first = exc.args[0]
+                winerror = first if isinstance(first, int) else None
+            self._configuration_failure(
+                "configuration_read_failed",
+                step=step,
+                error_type=type(exc).__name__,
+                winerror=winerror if winerror is not None else "none",
+            )
+            raise
+        finally:
+            if win32service is not None and service is not None:
+                try:
+                    win32service.CloseServiceHandle(service)
+                except Exception:
+                    pass
+            if win32service is not None and manager is not None:
+                try:
+                    win32service.CloseServiceHandle(manager)
+                except Exception:
+                    pass
+
+    def _configuration_failure(self, field: str, *, _identity: object | None = None, **details: object) -> bool:
+        safe_details = tuple(sorted((key, _diagnostic_value(value)) for key, value in details.items()))
+        signature = (field, safe_details if _identity is None else _identity)
+        with self._configuration_diagnostic_lock:
+            if signature == self._last_configuration_failure:
+                return False
+            self._last_configuration_failure = signature
+        suffix = " ".join(f"{key}={value}" for key, value in safe_details)
+        logger.warning(
+            "sandbox Broker service configuration check failed field=%s%s",
+            field,
+            f" {suffix}" if suffix else "",
+        )
+        return False
+
+    def _configuration_recovered(self) -> None:
+        with self._configuration_diagnostic_lock:
+            self._last_configuration_failure = None
+
+    def service_state(self) -> dict:
+        self._require_windows()
+        from ..control.service_state import query_service
+
+        return query_service(self.service_name)
+
+    def start(self) -> None:
+        self._require_windows()
+        from ..control.service_state import start_service
+
+        try:
+            start_service(self.service_name)
+        except Exception as exc:
+            if getattr(exc, "winerror", None) not in {5, 740}:
+                raise
+            self._run_elevated_transaction("start", self._current_user_sid())
+
+    def service_installed(self) -> bool:
+        """Return whether SCM contains this service, preserving other query failures."""
+
+        if not self.is_windows:
+            return False
+        manager = None
+        service = None
+        win32service = None
+        try:
+            import win32service as win32service_module  # type: ignore[import-not-found]
+
+            win32service = win32service_module
+            manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+            service = win32service.OpenService(manager, self.service_name, win32service.SERVICE_QUERY_STATUS)
+            return True
+        except Exception as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror is None and getattr(exc, "args", None):
+                first = exc.args[0]
+                winerror = first if isinstance(first, int) else None
+            if winerror == 1060:
+                return False
+            raise
+        finally:
+            if win32service is not None and service is not None:
+                try:
+                    win32service.CloseServiceHandle(service)
+                except Exception:
+                    pass
+            if win32service is not None and manager is not None:
+                try:
+                    win32service.CloseServiceHandle(manager)
+                except Exception:
+                    pass
+
+    def _run_transaction(self, operation: str) -> None:
+        backend_sid = self._current_user_sid()
+        if self._runner_injected:
+            self._run_local_transaction(operation, backend_sid)
+            return
+        self._run_elevated_transaction(operation, backend_sid)
+
+    def _prepare_service_host(self) -> None:
+        if self.service_class is None:
+            return
+        try:
+            import pywintypes  # type: ignore[import-not-found]
+            import servicemanager  # type: ignore[import-not-found]
+            import win32api  # type: ignore[import-not-found]
+            import win32serviceutil  # type: ignore[import-not-found]
+
+            executable_path = Path(_absolute_windows_path(win32serviceutil.LocatePythonServiceExe()))
+            python_dll = Path(_absolute_windows_path(win32api.GetModuleFileName(sys.dllhandle)))
+            base_prefix = Path(_absolute_windows_path(sys.base_prefix))
+            environment_prefix = Path(_absolute_windows_path(sys.prefix))
+            runtime_binaries = [
+                python_dll,
+                Path(pywintypes.__file__).resolve(),
+                Path(servicemanager.__file__).resolve(),
+            ]
+            runtime_binaries.extend(
+                candidate
+                for name in ("python3.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+                if (candidate := python_dll.parent / name).is_file()
+            )
+            for source in runtime_binaries:
+                target = executable_path.parent / source.name
+                if not target.exists() or not filecmp.cmp(source, target, shallow=False):
+                    shutil.copy2(source, target)
+            _write_python_service_path(executable_path, base_prefix, environment_prefix)
+            executable = _absolute_windows_path(executable_path)
+        except Exception as exc:  # pragma: no cover - Windows install path
+            raise BrokerInstallationError(
+                BrokerInstallFailureCode.DEPENDENCY_MISSING,
+                "缺少 Windows Broker 服务宿主，请重新安装后端依赖。",
+            ) from exc
+        self.service_command = (executable,)
+
+    def _run_local_transaction(self, operation: str, backend_sid: str | None) -> None:
+        """Execute the same transaction through an injected test runner."""
+
+        sid: str | None = None
+        if self.backend_sid_path is not None and backend_sid is not None:
+            try:
+                self.backend_sid_path.parent.mkdir(parents=True, exist_ok=True)
+                self.backend_sid_path.write_text(backend_sid, encoding="ascii")
+                sid = backend_sid
+            except OSError as exc:
+                raise BrokerInstallationError(
+                    BrokerInstallFailureCode.ACL_FAILED,
+                    "Broker 文件权限配置失败，请以管理员权限重试。",
+                ) from exc
+        from ..installation.access_policy import (
+            _managed_file_acl_commands,
+            _program_data_acl_commands,
+            _runtime_acl_grants,
+            _sensitive_file_acl_commands,
+            _service_class_command,
+            _sid_acl_command,
+            _source_acl_grants,
+        )
+
+        command = subprocess.list2cmdline(list(self.service_command))
+        commands: list[list[str]] = []
+        if self.backend_sid_path is not None and sid is not None:
+            commands.append(_sid_acl_command(self.backend_sid_path, sid, None))
+        if operation == "install":
+            commands.extend(
+                [
+                    [
+                        "sc.exe",
+                        "create",
+                        self.service_name,
+                        "type=",
+                        "own",
+                        "start=",
+                        "demand",
+                        "obj=",
+                        f"NT SERVICE\\{self.service_name}",
+                        "binPath=",
+                        command,
+                    ],
+                    *([_service_class_command(self.service_name, self.service_class)] if self.service_class else []),
+                    ["sc.exe", "sidtype", self.service_name, "unrestricted"],
+                ]
+            )
+        else:
+            commands.extend(
+                [
+                    ["sc.exe", "stop", self.service_name],
+                    [
+                        "sc.exe",
+                        "config",
+                        self.service_name,
+                        "type=",
+                        "own",
+                        "start=",
+                        "demand",
+                        "obj=",
+                        f"NT SERVICE\\{self.service_name}",
+                        "binPath=",
+                        command,
+                    ],
+                    *([_service_class_command(self.service_name, self.service_class)] if self.service_class else []),
+                    ["sc.exe", "sidtype", self.service_name, "unrestricted"],
+                ]
+            )
+        if self.program_data_path is not None and self.backend_sid_path is not None:
+            try:
+                # Build the ACL command through the same validation as the
+                # elevated helper, while executing it with the injected runner.
+                persisted_sid = self.backend_sid_path.read_text(encoding="ascii").strip()
+                commands.extend(
+                    _program_data_acl_commands(
+                        self.program_data_path,
+                        self.backend_sid_path,
+                        persisted_sid,
+                        self.service_name,
+                    )
+                )
+                for name in (
+                    "installation.id",
+                    "installation.key.dpapi",
+                    "ready.json",
+                    "control-plane.jsonl",
+                    "resources.json",
+                ):
+                    commands.extend(
+                        _managed_file_acl_commands(
+                            self.program_data_path / name,
+                            persisted_sid,
+                            self.service_name,
+                        )
+                    )
+                commands.extend(
+                    _sensitive_file_acl_commands(
+                        self.program_data_path / "accounts.dpapi",
+                        self.service_name,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                raise BrokerInstallationError(
+                    BrokerInstallFailureCode.ACL_FAILED,
+                    "Broker 文件权限配置失败，请以管理员权限重试。",
+                ) from exc
+        if self.service_code_path is not None and self.service_code_boundary_path is not None:
+            try:
+                commands.extend(
+                    grant.runner_command()
+                    for grant in _source_acl_grants(
+                        self.service_code_path, self.service_code_boundary_path, self.service_name
+                    )
+                )
+            except ValueError as exc:
+                raise BrokerInstallationError(
+                    BrokerInstallFailureCode.ACL_FAILED,
+                    "Broker 文件权限配置失败，请以管理员权限重试。",
+                ) from exc
+        try:
+            commands.extend(
+                grant.runner_command()
+                for grant in _runtime_acl_grants(
+                    self.service_runtime_paths,
+                    Path(self.service_command[0]),
+                    self.service_name,
+                )
+            )
+        except ValueError as exc:
+            raise BrokerInstallationError(
+                BrokerInstallFailureCode.ACL_FAILED,
+                "Broker 运行时权限配置失败，请以管理员权限重试。",
+            ) from exc
+        commands.append(["sc.exe", "start", self.service_name])
+        for command_args in commands:
+            result = self.runner(command_args, check=False, capture_output=True)
+            returncode = int(getattr(result, "returncode", 1))
+            service_already_running = command_args[:2] == ["sc.exe", "start"] and returncode == 1056
+            service_already_stopped = command_args[:2] == ["sc.exe", "stop"] and returncode == 1062
+            if returncode != 0 and not service_already_running and not service_already_stopped:
+                if command_args[0].lower() in {"icacls.exe", "takeown.exe", "win32-acl"}:
+                    failure_code = BrokerInstallFailureCode.ACL_FAILED
+                    message = "Broker 文件权限配置失败，请以管理员权限重试。"
+                elif len(command_args) > 1 and command_args[1].lower() == "start":
+                    failure_code = BrokerInstallFailureCode.SERVICE_START_FAILED
+                    message = "Broker Windows 服务启动失败。"
+                elif len(command_args) > 1 and command_args[1].lower() == "stop":
+                    failure_code = BrokerInstallFailureCode.SERVICE_STOP_FAILED
+                    message = "Broker Windows 服务未能停止，请稍后重试或重启 Windows。"
+                else:
+                    failure_code = BrokerInstallFailureCode.SERVICE_FAILED
+                    message = "Windows 服务创建或配置失败。"
+                raise BrokerInstallationError(
+                    failure_code,
+                    message,
+                )
+
+    def _run_elevated_transaction(self, operation: str, backend_sid: str | None) -> None:
+        """Run the complete control-plane operation behind one UAC prompt."""
+
+        try:
+            import win32con  # type: ignore[import-not-found]
+            import win32event  # type: ignore[import-not-found]
+            import win32process  # type: ignore[import-not-found]
+            from win32com.shell import shell  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - Windows install path
+            raise BrokerInstallationError(
+                BrokerInstallFailureCode.DEPENDENCY_MISSING,
+                "缺少 Windows Broker 安装依赖，请重新安装后端依赖。",
+            ) from exc
+
+        action = "启动" if operation == "start" else "安装"
+        helper_action = "启动" if operation == "start" else "修复"
+        result_id = uuid.uuid4().hex
+        payload = {
+            "result_id": result_id,
+            "operation": operation,
+            "service_name": self.service_name,
+            "service_command": list(self.service_command),
+            "service_class": self.service_class,
+            "backend_sid": backend_sid,
+            "backend_sid_path": str(self.backend_sid_path) if self.backend_sid_path is not None else None,
+            "program_data_path": str(self.program_data_path) if self.program_data_path is not None else None,
+            "service_code_path": str(self.service_code_path) if self.service_code_path is not None else None,
+            "service_code_boundary_path": (
+                str(self.service_code_boundary_path) if self.service_code_boundary_path is not None else None
+            ),
+            "service_runtime_paths": [str(path) for path in self.service_runtime_paths],
+            "proxy_port": self.proxy_port,
+        }
+        encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        parameters = subprocess.list2cmdline(list(_elevated_helper_argv(encoded, self.service_code_path)))
+        handle: Any | None = None
+        try:  # pragma: no cover - requires an interactive Windows desktop
+            result = shell.ShellExecuteEx(
+                fMask=getattr(win32con, "SEE_MASK_NOCLOSEPROCESS", 0x00000040),
+                lpVerb="runas",
+                lpFile=sys.executable,
+                lpParameters=parameters,
+                lpDirectory=str(self.service_code_path) if self.service_code_path is not None else None,
+                nShow=getattr(win32con, "SW_HIDE", 0),
+            )
+            handle = result["hProcess"] if isinstance(result, Mapping) else result
+            win32event.WaitForSingleObject(handle, win32event.INFINITE)
+            code = int(win32process.GetExitCodeProcess(handle))
+        except Exception as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror is None and getattr(exc, "args", None):
+                first = exc.args[0]
+                winerror = first if isinstance(first, int) else None
+            if winerror == 1223:
+                raise BrokerInstallationError(
+                    BrokerInstallFailureCode.UAC_CANCELLED,
+                    f"{action}已取消，请在 UAC 提示中批准 Broker {action}。",
+                ) from exc
+            if winerror in {5, 740}:
+                raise BrokerInstallationError(
+                    BrokerInstallFailureCode.ADMIN_REQUIRED,
+                    f"需要管理员权限才能{action}沙箱 Broker。",
+                ) from exc
+            raise BrokerInstallationError(
+                BrokerInstallFailureCode.UNKNOWN,
+                f"沙箱 Broker {action}失败，请查看后端日志。",
+            ) from exc
+        finally:
+            if handle is not None:
+                try:
+                    import win32api  # type: ignore[import-not-found]
+
+                    win32api.CloseHandle(handle)
+                except Exception:
+                    pass
+        if code == 0:
+            return
+        report = None
+        if self.program_data_path is not None:
+            from ..installation.results import read_result
+
+            try:
+                report = read_result(self.program_data_path, result_id)
+            except Exception as exc:
+                exc.add_note(f"Repair helper exited with code {code}; its exception report could not be read.")
+                raise
+        failure = BrokerInstallationError(
+            BrokerInstallFailureCode.UNKNOWN,
+            report["message"] if report else f"{helper_action}子进程退出码 {code}；未取得子进程异常详情。",
+        )
+        failure.error_report = report
+        failure.broker_code = {
+            2: BrokerInstallFailureCode.UNKNOWN,
+            3: BrokerInstallFailureCode.SERVICE_FAILED,
+            4: BrokerInstallFailureCode.ACL_FAILED,
+            5: BrokerInstallFailureCode.SERVICE_START_FAILED,
+            6: BrokerInstallFailureCode.ACL_FAILED,
+            7: BrokerInstallFailureCode.SERVICE_STOP_FAILED,
+            8: BrokerInstallFailureCode.ACCOUNT_FAILED,
+            9: BrokerInstallFailureCode.CREDENTIAL_FAILED,
+            10: BrokerInstallFailureCode.PRIVILEGE_FAILED,
+            11: BrokerInstallFailureCode.NETWORK_FAILED,
+            12: BrokerInstallFailureCode.BUSY,
+            13: BrokerInstallFailureCode.DEPENDENCY_MISSING,
+        }.get(code, BrokerInstallFailureCode.UNKNOWN)
+        raise failure
+
+    def _current_user_sid(self) -> str | None:
+        if self.backend_sid_path is None:
+            return None
+        try:
+            import win32api  # type: ignore[import-not-found]
+            import win32con  # type: ignore[import-not-found]
+            import win32security  # type: ignore[import-not-found]
+
+            token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+            sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+            return str(win32security.ConvertSidToStringSid(sid))
+        except ImportError as exc:  # pragma: no cover - Windows install path
+            raise BrokerInstallationError(
+                BrokerInstallFailureCode.DEPENDENCY_MISSING,
+                "缺少 Windows Broker 安装依赖，请重新安装后端依赖。",
+            ) from exc
+        except Exception as exc:  # pragma: no cover - Windows install path
+            raise BrokerInstallationError(
+                BrokerInstallFailureCode.UNKNOWN,
+                "无法读取当前 Windows 用户身份，请查看后端日志。",
+            ) from exc
+
+    def _require_windows(self) -> None:
+        if not self.is_windows:
+            raise SandboxInitializationError("Windows Broker service is unavailable on this platform")
+
+
+def _write_python_service_path(executable: Path, base_prefix: Path, environment_prefix: Path) -> Path:
+    path_file = executable.parent / f"python{sys.version_info.major}{sys.version_info.minor}._pth"
+    site_packages = environment_prefix / "Lib" / "site-packages"
+    entries = (
+        ".",
+        str((base_prefix / f"python{sys.version_info.major}{sys.version_info.minor}.zip").resolve()),
+        str((base_prefix / "Lib").resolve()),
+        str((base_prefix / "DLLs").resolve()),
+        str(site_packages.resolve()),
+        str((site_packages / "win32").resolve()),
+        str((site_packages / "win32" / "lib").resolve()),
+    )
+    if any("\n" in entry or "\r" in entry for entry in entries):
+        raise ValueError("Broker Python runtime path is invalid")
+    content = "\n".join(entries) + "\n"
+    try:
+        if path_file.read_text(encoding="utf-8") == content:
+            return path_file
+    except OSError:
+        pass
+    temporary = path_file.with_name(f".{path_file.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8", newline="\n")
+        os.replace(temporary, path_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path_file

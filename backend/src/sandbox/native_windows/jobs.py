@@ -1,0 +1,135 @@
+"""Windows Kernel Job Object resource containment."""
+
+from __future__ import annotations
+
+import ctypes
+from typing import Any
+
+from ..policy import ResourceLimits
+from .api import _modules
+
+
+class WindowsJobObject:
+    """Kernel Job Object with kill-on-close, CPU, memory and process limits."""
+
+    def __init__(self, name: str, limits: ResourceLimits) -> None:
+        modules = _modules()
+        self._api = modules["api"]
+        self._job = modules["job"]
+        self.handle = None
+        try:
+            self.handle = self._job.CreateJobObject(None, name)
+            info = self._job.QueryInformationJobObject(
+                self.handle,
+                self._job.JobObjectExtendedLimitInformation,
+            )
+            basic = dict(info.get("BasicLimitInformation") or {})
+            flags = (
+                self._job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | self._job.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                | self._job.JOB_OBJECT_LIMIT_JOB_TIME
+                | self._job.JOB_OBJECT_LIMIT_JOB_MEMORY
+            )
+            basic.update(
+                {
+                    "LimitFlags": flags,
+                    "ActiveProcessLimit": limits.processes,
+                    "PerJobUserTimeLimit": limits.cpu_seconds * 10_000_000,
+                }
+            )
+            info["BasicLimitInformation"] = basic
+            info["JobMemoryLimit"] = limits.memory_mib * 1024 * 1024
+            self._job.SetInformationJobObject(
+                self.handle,
+                self._job.JobObjectExtendedLimitInformation,
+                info,
+            )
+        except Exception:  # pragma: no cover - Windows kernel adapter
+            if self.handle is not None:
+                self._api.CloseHandle(self.handle)
+                self.handle = None
+            raise
+
+    def assign(self, process_handle: Any) -> None:
+        self._job.AssignProcessToJobObject(self.handle, process_handle)
+
+    def terminate(self, exit_code: int = 1) -> None:
+        if self.handle is None:
+            return
+        self._job.TerminateJobObject(self.handle, exit_code)
+
+    def usage(self) -> dict[str, int | float]:
+        """Return cumulative Job Object accounting without exposing PIDs."""
+
+        try:
+            accounting = self._job.QueryInformationJobObject(
+                self.handle,
+                self._job.JobObjectBasicAndIoAccountingInformation,
+            )
+            extended = self._job.QueryInformationJobObject(
+                self.handle,
+                self._job.JobObjectExtendedLimitInformation,
+            )
+            process_ids = self._job.QueryInformationJobObject(
+                self.handle,
+                self._job.JobObjectBasicProcessIdList,
+            )
+            basic = accounting.get("BasicInfo") or accounting.get("BasicAccountingInformation") or {}
+            io = accounting.get("IoInfo") or accounting.get("IoAccountingInformation") or {}
+            pids = tuple(int(value) for value in process_ids if int(value) > 0)
+            handles = sum(self._handle_count(pid) for pid in pids)
+            total_time_100ns = int(basic.get("TotalUserTime", 0)) + int(basic.get("TotalKernelTime", 0))
+            memory_bytes = sum(self._private_memory(pid) for pid in pids)
+            return {
+                "cpu_seconds": total_time_100ns / 10_000_000,
+                "memory_bytes": memory_bytes,
+                "peak_memory_bytes": int(extended.get("PeakJobMemoryUsed", 0)),
+                "processes": len(pids),
+                "handles": handles,
+                "write_io_bytes": int(io.get("WriteTransferCount", 0)),
+            }
+        except Exception as exc:  # pragma: no cover - Windows kernel adapter
+            raise OSError("sandbox Job Object usage could not be sampled") from exc
+
+    @staticmethod
+    def _private_memory(pid: int) -> int:
+        import win32api
+        import win32process
+
+        try:
+            handle = win32api.OpenProcess(0x0400 | 0x0010, False, pid)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 87:
+                return 0
+            raise
+        try:
+            return int(win32process.GetProcessMemoryInfo(handle)["PagefileUsage"])
+        finally:
+            handle.Close()
+
+    @staticmethod
+    def _handle_count(pid: int) -> int:
+        import win32api
+
+        try:
+            process = win32api.OpenProcess(0x1000, False, pid)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 87:
+                return 0
+            raise
+        try:
+            count = ctypes.c_uint32()
+            get_count = ctypes.WinDLL("kernel32", use_last_error=True).GetProcessHandleCount
+            get_count.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+            get_count.restype = ctypes.c_int
+            if not get_count(int(process), ctypes.byref(count)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return int(count.value)
+        finally:
+            process.Close()
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        self._api.CloseHandle(self.handle)
+        self.handle = None

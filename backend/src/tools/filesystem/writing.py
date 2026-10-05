@@ -1,0 +1,181 @@
+"""Workspace-confined file mutation operations."""
+
+from __future__ import annotations
+
+import os
+import shutil
+
+from ..base import ToolError
+
+
+class FileWriteMixin:
+    def file_operation(
+        self,
+        operation: str,
+        path: str,
+        *,
+        type: str | None = None,
+        content: str = "",
+        start_line: int = -1,
+        end_line: int = -1,
+        expected_content: str = "",
+    ) -> str:
+        """Dispatch schema-validated file operations through the existing write safeguards."""
+
+        if operation == "create":
+            if type == "directory":
+                return self.create_directory(path)
+            if type == "file":
+                return self.write_file(path, content)
+            raise ToolError("Create requires type=file or directory.")
+        if operation == "delete":
+            return self.delete_path(path)
+        if operation != "write":
+            raise ToolError(f"Unknown file operation: {operation}")
+        if start_line == -1 and end_line == -1 and expected_content == "":
+            return self.write_file(path, content, overwrite=True)
+
+        self._validate_integer("start_line", start_line, minimum=1)
+        self._validate_integer("end_line", end_line, minimum=1)
+        if end_line < start_line:
+            raise ToolError("end_line must be greater than or equal to start_line.")
+        # An empty expectation denotes one blank line, while empty replacement text deletes the range.
+        expected_lines = self._normalise_newlines(expected_content).split("\n")
+        if len(expected_lines) != end_line - start_line + 1:
+            raise ToolError("expected_content must contain every selected line. Read the file again before editing.")
+        replacement_lines = [line for line, _ending in self._line_records(content)]
+        return self.edit_file(path, start_line, end_line, expected_lines, replacement_lines)
+
+    def delete_path(self, path: str) -> str:
+        """Delete one confined entry after checking the entire target tree before mutation."""
+
+        target = self._write_path(path)
+        protected_roots = (*self.workspaces, *self.read_file_roots)
+        if any(root.is_relative_to(target) for root in protected_roots):
+            raise ToolError("Cannot delete a workspace or read-only root, or an ancestor of one.")
+        display_path = self._display_path(target)
+        try:
+            if target.is_dir():
+                pending = [target]
+                while pending:
+                    directory = self._write_path(str(pending.pop()))
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            child = self._write_path(entry.path)
+                            if child.is_dir():
+                                pending.append(child)
+                target = self._write_path(str(target))
+                shutil.rmtree(target)
+                return f"Deleted directory {display_path} and its contents."
+            if not target.is_file():
+                raise ToolError(f"Not a file or directory: {display_path}")
+            target.unlink()
+        except OSError as exc:
+            raise ToolError(f"Could not delete {display_path}: {exc.strerror or str(exc)}") from exc
+        return f"Deleted file {display_path}."
+
+    def create_directory(self, path: str) -> str:
+        """Recursively create one approved-workspace directory."""
+
+        directory_path = self._write_path(path)
+        path = self._display_path(directory_path)
+        current = directory_path
+        while not current.exists() and current not in self.workspaces:
+            current = current.parent
+        if current.exists() and not current.is_dir():
+            raise ToolError(f"Not a directory: {self._display_candidate(current)}")
+        if directory_path.is_dir():
+            return f"Directory already exists: {self._display_path(directory_path)}."
+        try:
+            directory_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError(f"Could not create directory {path}: {exc.strerror or str(exc)}") from exc
+        return f"Created directory {self._display_path(directory_path)}."
+
+    def write_file(self, path: str, content: str, overwrite: bool = False) -> str:
+        """Create a new UTF-8 file or explicitly replace an existing file."""
+
+        if not isinstance(content, str):
+            raise ToolError("content must be a string.")
+        if not isinstance(overwrite, bool):
+            raise ToolError("overwrite must be a boolean.")
+        file_path = self._write_path(path)
+        path = self._display_path(file_path)
+        if not file_path.parent.is_dir():
+            self.create_directory(str(file_path.parent))
+            file_path = self._write_path(path)
+        if file_path.exists() and not file_path.is_file():
+            raise ToolError(f"Not a file: {path}")
+
+        if file_path.exists():
+            if not overwrite:
+                raise ToolError(f"File already exists: {path}. Pass overwrite=true to replace it.")
+            original = self._read_raw(file_path, path)
+            self._atomic_replace(file_path, content, expected_content=original)
+            return f"Replaced {self._display_path(file_path)} with {len(content)} characters."
+
+        self._exclusive_create(file_path, content)
+        return f"Created {self._display_path(file_path)} with {len(content)} characters."
+
+    def edit_file(
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        expected_lines: list[str],
+        replacement_lines: list[str],
+    ) -> str:
+        """Replace one inclusive line range after checking its current contents."""
+
+        self._validate_integer("start_line", start_line, minimum=1)
+        self._validate_integer("end_line", end_line, minimum=1)
+        if end_line < start_line:
+            raise ToolError("end_line must be greater than or equal to start_line.")
+        for name, lines in (("expected_lines", expected_lines), ("replacement_lines", replacement_lines)):
+            if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+                raise ToolError(f"{name} must be an array of strings.")
+            if any("\n" in line or "\r" in line for line in lines):
+                raise ToolError(f"{name} entries must not contain line-break characters.")
+        if len(expected_lines) != end_line - start_line + 1:
+            raise ToolError("expected_lines length must match the inclusive line range.")
+
+        file_path = self._write_path(path)
+        path = self._display_path(file_path)
+        if not file_path.is_file():
+            raise ToolError(f"Not a file: {path}")
+        original = self._read_raw(file_path, path)
+        records = self._line_records(original)
+        if end_line > len(records):
+            raise ToolError(f"Line range {start_line}-{end_line} exceeds the file's {len(records)} lines.")
+        selected = [content for content, _ending in records[start_line - 1 : end_line]]
+        if selected != expected_lines:
+            raise ToolError(
+                "The selected lines no longer match the expected content; file was not changed. "
+                "Read the file again before editing."
+            )
+        newline = self._dominant_newline(original)
+        prefix = "".join(content + ending for content, ending in records[: start_line - 1])
+        suffix = "".join(content + ending for content, ending in records[end_line:])
+        selected_ending = records[end_line - 1][1]
+        replacement = ""
+        for index, line in enumerate(replacement_lines):
+            is_last = index == len(replacement_lines) - 1
+            ending = selected_ending if is_last else newline
+            if is_last and not ending and not line:
+                ending = newline
+            replacement += line + ending
+        updated = prefix + replacement + suffix
+        self._atomic_replace(file_path, updated, expected_content=original)
+        return f"Edited {self._display_path(file_path)}: replaced lines {start_line}-{end_line}."
+
+    @staticmethod
+    def _line_records(value: str) -> list[tuple[str, str]]:
+        records: list[tuple[str, str]] = []
+        for raw in value.splitlines(keepends=True):
+            if raw.endswith("\r\n"):
+                records.append((raw[:-2], "\r\n"))
+            elif raw.endswith(("\n", "\r")):
+                records.append((raw[:-1], raw[-1]))
+            else:
+                records.append((raw, ""))
+        return records

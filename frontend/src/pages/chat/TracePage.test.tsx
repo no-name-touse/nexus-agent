@@ -1,0 +1,491 @@
+import { App as AntApp } from "antd";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getTurnTrace } from "../../api";
+import { TURN_PROTOCOL_VERSION } from "../../app/runtime/runtimeNodeNormalization";
+import type { RuntimeStateNode, TurnTraceItem, TurnTraceResponse } from "../../types";
+import TracePage from "./TracePage";
+
+vi.mock("../../api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../api")>(),
+  getTurnTrace: vi.fn(),
+}));
+
+function turn(id: string, timestamp: string, status: RuntimeStateNode["status"] = "success"): RuntimeStateNode {
+  return {
+    thread_id: "thread-a",
+    parent_thread_id: "",
+    session_id: "session-a",
+    parent_session_id: "",
+    id,
+    parent_id: "",
+    version: TURN_PROTOCOL_VERSION,
+    firstKeptItemSize: 8,
+    compactionId: id,
+    user: "",
+    provider_name: "local",
+    model: {
+      reasoning_effort: "medium",
+      current_model: "fake",
+      context_length: 4096,
+      output_length: 512,
+      thinking: "enable",
+      temperature: 0,
+    },
+    permission_mode: "read_only",
+    running_mode: "agent",
+    usage: { input_tokens: 1, cached_tokens: 0, output_tokens: 1, reasoning_tokens: 0, total_tokens: 2 },
+    cwd: "C:\\workspace",
+    project_cwd: "",
+    timestamp,
+    status,
+    current_data_idx: 1,
+    data: [0, 1].map((version) => [
+      { role: "user", content: [{ type: "text", text: `question-${version}`, status: "success" }] },
+      { role: "assistant", content: [
+        { type: "reasoning", text: `reason-${version}`, status: "success" },
+        { type: "text", text: `answer-${version}`, status: "success" },
+      ] },
+    ]),
+  };
+}
+
+function traceItem(
+  sequence: number,
+  messageIdx: number,
+  itemIdx: number,
+  role: TurnTraceItem["role"],
+  item: TurnTraceItem["item"],
+): TurnTraceItem {
+  return {
+    sequence,
+    message_idx: messageIdx,
+    item_idx: itemIdx,
+    role,
+    item,
+    completed_at: `2026-08-28T00:00:0${sequence}Z`,
+  };
+}
+
+function response(
+  value: RuntimeStateNode,
+  dataIdx: number,
+  options: { context?: boolean; items?: TurnTraceItem[] } = {},
+): TurnTraceResponse {
+  const items = options.items ?? [
+    traceItem(1, 0, 0, "user", { type: "text", text: `question-${dataIdx}`, status: "success" }),
+    traceItem(2, 1, 0, "assistant", { type: "reasoning", text: `reason-${dataIdx}`, status: "success" }),
+    traceItem(3, 1, 1, "assistant", { type: "text", text: `answer-${dataIdx}`, status: "success" }),
+  ];
+  return {
+    context: options.context === false ? null : {
+      system_message: "base system\n\n## User Agent Preferences\nconcise",
+      initialized_at: value.timestamp,
+      active_skills: [{ name: "demo", instructions: "skill instructions" }],
+      tools: [{
+        name: "mcp_demo_search",
+        description: "Search",
+        parameters: { type: "object" },
+        origin: { kind: "mcp", server: "demo", tool: "search" },
+      }],
+    },
+    items,
+    last_sequence: Math.max(0, ...items.map((item) => item.sequence)),
+  };
+}
+
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.useRealTimers();
+});
+
+function outerTurnPanel(turnId: string): HTMLElement {
+  const panel = screen.getByTitle(turnId).closest(".ant-collapse-item");
+  if (!(panel instanceof HTMLElement)) throw new Error(`Turn panel ${turnId} is missing.`);
+  return panel;
+}
+
+function clickTurnHeader(turnId: string): void {
+  const header = outerTurnPanel(turnId).querySelector(":scope > .ant-collapse-header");
+  if (!(header instanceof HTMLElement)) throw new Error(`Turn header ${turnId} is missing.`);
+  fireEvent.click(header);
+}
+
+describe("TracePage", () => {
+  it("keeps reused message positions independently expandable and shows runtime details", async () => {
+    const latest = turn("turn-retry", "2026-09-15T00:00:00Z");
+    vi.mocked(getTurnTrace).mockResolvedValue(response(latest, 1, {
+      items: [
+        traceItem(1, 1, 0, "assistant", { type: "text", text: "first attempt", status: "success" }),
+        traceItem(2, 1, 0, "assistant", { type: "text", text: "second attempt", status: "success" }),
+        { ...traceItem(3, 0, 0, "runtime", {
+          type: "runtime_event", event: "mode_changed", status: "success",
+          data: { old_mode: "agent", new_mode: "plan", source: "runtime_config" },
+        }), message_idx: null, item_idx: null },
+      ],
+    }));
+    render(<AntApp><TracePage turns={[latest]} /></AntApp>);
+    const first = (await screen.findByTitle("first attempt")).closest(".ant-collapse-item")!;
+    const second = screen.getByTitle("second attempt").closest(".ant-collapse-item")!;
+    fireEvent.click(first.querySelector(".ant-collapse-header")!);
+    expect(first).toHaveClass("ant-collapse-item-active");
+    expect(second).not.toHaveClass("ant-collapse-item-active");
+    fireEvent.click(second.querySelector(".ant-collapse-header")!);
+    expect(first).toHaveClass("ant-collapse-item-active");
+    expect(second).toHaveClass("ant-collapse-item-active");
+    fireEvent.click(screen.getByTitle("mode_changed"));
+    expect(await screen.findByText(/"old_mode": "agent"/)).toBeInTheDocument();
+  });
+
+  it("labels collaboration instructions as Developer", async () => {
+    const latest = turn("turn-mode", "2026-09-12T00:00:00Z");
+    vi.mocked(getTurnTrace).mockResolvedValue(response(latest, 1, {
+      items: [traceItem(1, 2, 0, "developer", {
+        type: "text", text: "<collaboration_mode>plan instructions</collaboration_mode>", status: "success",
+      })],
+    }));
+    render(<AntApp><TracePage turns={[latest]} /></AntApp>);
+    expect(await screen.findByText("Developer")).toBeInTheDocument();
+    expect(screen.queryByText("Assistant Response")).not.toBeInTheDocument();
+  });
+
+  it("downloads the entire thread independently of expanded turns and preview versions", async () => {
+    const older = turn("turn-older", "2026-09-09T00:00:00Z");
+    const latest = turn("turn-latest", "2026-09-10T00:00:00Z");
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, id, dataIdx) => response(id === older.id ? older : latest, dataIdx));
+    render(<AntApp><TracePage turns={[older, latest]} /></AntApp>);
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledTimes(1));
+    const download = screen.getByRole("link", { name: /下载 Trace/ });
+    const url = "/api/turns/trace/export?session_id=session-a&thread_id=thread-a";
+    expect(download).toHaveAttribute("href", url);
+    expect(download).toHaveAttribute("download");
+    fireEvent.click(screen.getByLabelText(`${latest.id} 上一个 data 版本`));
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      latest.session_id, latest.thread_id, latest.id, 0, expect.any(AbortSignal), undefined,
+    ));
+    expect(download).toHaveAttribute("href", url);
+    clickTurnHeader(latest.id);
+    expect(screen.getAllByRole("link", { name: /下载 Trace/ })).toHaveLength(1);
+  });
+
+  it("does not offer a download before the thread has any turns", () => {
+    render(<AntApp><TracePage turns={[]} /></AntApp>);
+    expect(screen.queryByRole("link", { name: /下载 Trace/ })).not.toBeInTheDocument();
+  });
+
+  it("renders completed parallel tools as one outer group with call-ID children", async () => {
+    const latest = turn("turn-parallel", "2026-09-05T00:00:00Z");
+    const group = "parallel:call-1";
+    vi.mocked(getTurnTrace).mockResolvedValue(response(latest, 1, {
+      items: [
+        traceItem(1, 1, 0, "assistant", { type: "tool_call", call_id: "call-2", name: "read_file", status: "success", parallel_group_id: group, parallel_index: 1, parallel_size: 2 }),
+        traceItem(2, 1, 1, "assistant", { type: "tool_result", call_id: "call-2", tool: "read_file", content: "two", status: "success", parallel_group_id: group, parallel_index: 1, parallel_size: 2 }),
+        traceItem(3, 1, 2, "assistant", { type: "tool_call", call_id: "call-1", name: "read_file", status: "success", parallel_group_id: group, parallel_index: 0, parallel_size: 2 }),
+        traceItem(4, 1, 3, "assistant", { type: "tool_result", call_id: "call-1", tool: "read_file", content: "one", status: "success", parallel_group_id: group, parallel_index: 0, parallel_size: 2 }),
+      ],
+    }));
+
+    const { container } = render(<AntApp><TracePage turns={[latest]} /></AntApp>);
+    const groupTitle = await screen.findByTitle("并行调用工具");
+    fireEvent.click(groupTitle.closest(".ant-collapse-header")!);
+    await waitFor(() => expect(container.querySelectorAll(".trace-parallel-inner-collapse")).toHaveLength(1));
+    expect(container.querySelectorAll(".trace-parallel-inner-collapse")).toHaveLength(1);
+    expect(screen.getByTitle("read_file · call-1")).toBeInTheDocument();
+    expect(screen.getByTitle("read_file · call-2")).toBeInTheDocument();
+  });
+
+  it("renders every Turn oldest first and loads only the latest Turn initially", async () => {
+    const older = turn("turn-old", "2026-08-27T00:00:00Z");
+    const sameTimestampA = turn("turn-a", "2026-08-28T00:00:00Z");
+    const latest = turn("turn-b", "2026-08-28T00:00:00Z");
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, turnId, dataIdx) => response(
+      [older, sameTimestampA, latest].find((candidate) => candidate.id === turnId)!,
+      dataIdx,
+    ));
+
+    const { container } = render(<AntApp><TracePage turns={[latest, older, sameTimestampA]} /></AntApp>);
+
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      latest.session_id, latest.thread_id, "turn-b", 1, expect.any(AbortSignal), undefined,
+    ));
+    expect([...container.querySelectorAll(".trace-turn-id")].map((element) => element.textContent))
+      .toEqual(["turn-old", "turn-a", "turn-b"]);
+    expect(screen.queryByRole("combobox", { name: "选择 Turn" })).not.toBeInTheDocument();
+    expect(outerTurnPanel("turn-old")).not.toHaveClass("ant-collapse-item-active");
+    expect(outerTurnPanel("turn-a")).not.toHaveClass("ant-collapse-item-active");
+    expect(outerTurnPanel("turn-b")).toHaveClass("ant-collapse-item-active");
+    expect(getTurnTrace).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByText("System")).toHaveLength(1);
+    expect(screen.getAllByText("Skill")).toHaveLength(1);
+    expect(screen.getAllByText("MCP")).toHaveLength(1);
+    expect(screen.getAllByText("User Message")).toHaveLength(1);
+    expect(screen.getAllByText("Assistant Reasoning")).toHaveLength(1);
+    expect(screen.getAllByText("Assistant Response")).toHaveLength(1);
+    expect(screen.getByText("Skill").closest(".ant-tag")).toHaveClass("ant-tag-cyan");
+    expect(screen.getByText("MCP").closest(".ant-tag")).toHaveClass("ant-tag-orange");
+    expect(screen.getByText("User Message").closest(".ant-tag")).toHaveClass("ant-tag-green");
+  });
+
+  it("labels retry trace Items as network retries instead of tools", async () => {
+    const value = turn("turn-retry", "2026-08-28T00:00:00Z");
+    vi.mocked(getTurnTrace).mockResolvedValue(response(value, 1, {
+      items: [
+        traceItem(1, 0, 0, "user", { type: "text", text: "retry", status: "success" }),
+        traceItem(2, 1, 0, "assistant", {
+          type: "retry",
+          event: "model_retry",
+          category: "network",
+          message: "connection reset by peer",
+          attempt: 1,
+          max_retries: 3,
+          delay_seconds: 0.5,
+          status: "success",
+        }),
+      ],
+    }));
+
+    render(<AntApp><TracePage turns={[value]} /></AntApp>);
+
+    await waitFor(() => expect(screen.getByText("Network Retry", { exact: true })).toBeInTheDocument());
+    expect(screen.getByText("Network Retry", { exact: true }).closest(".ant-tag")).toHaveClass("ant-tag-volcano");
+    expect(screen.getByTitle("connection reset by peer")).toBeInTheDocument();
+  });
+
+  it("switches each Turn data version independently without toggling its panel", async () => {
+    const older = turn("turn-old", "2026-08-27T00:00:00Z");
+    const latest = turn("turn-new", "2026-08-28T00:00:00Z");
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, turnId, dataIdx) => response(
+      turnId === older.id ? older : latest,
+      dataIdx,
+    ));
+    render(<AntApp><TracePage turns={[latest, older]} /></AntApp>);
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      latest.session_id, latest.thread_id, "turn-new", 1, expect.any(AbortSignal), undefined,
+    ));
+
+    fireEvent.click(screen.getByRole("button", { name: "turn-old 上一个 data 版本" }));
+    expect(outerTurnPanel("turn-old")).not.toHaveClass("ant-collapse-item-active");
+    expect(vi.mocked(getTurnTrace).mock.calls.some(([, , turnId]) => turnId === "turn-old")).toBe(false);
+
+    clickTurnHeader("turn-old");
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      older.session_id, older.thread_id, "turn-old", 0, expect.any(AbortSignal), undefined,
+    ));
+    expect(outerTurnPanel("turn-old")).toHaveClass("ant-collapse-item-active");
+    expect(outerTurnPanel("turn-new")).toHaveClass("ant-collapse-item-active");
+
+    fireEvent.click(screen.getByRole("button", { name: "turn-new 上一个 data 版本" }));
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      latest.session_id, latest.thread_id, "turn-new", 0, expect.any(AbortSignal), undefined,
+    ));
+    expect(outerTurnPanel("turn-new")).toHaveClass("ant-collapse-item-active");
+    expect(screen.getAllByText("1/2")).toHaveLength(2);
+  });
+
+  it("aborts a Turn request when collapsed and reloads its full baseline when reopened", async () => {
+    const older = turn("turn-old", "2026-08-27T00:00:00Z");
+    const latest = turn("turn-new", "2026-08-28T00:00:00Z");
+    let olderCalls = 0;
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, turnId, dataIdx) => {
+      if (turnId === latest.id) return response(latest, dataIdx);
+      olderCalls += 1;
+      if (olderCalls === 1) return new Promise<TurnTraceResponse>(() => undefined);
+      return response(older, dataIdx);
+    });
+    render(<AntApp><TracePage turns={[older, latest]} /></AntApp>);
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      latest.session_id, latest.thread_id, "turn-new", 1, expect.any(AbortSignal), undefined,
+    ));
+
+    clickTurnHeader("turn-old");
+    await waitFor(() => expect(olderCalls).toBe(1));
+    const firstOlderCall = vi.mocked(getTurnTrace).mock.calls.find(([, , turnId]) => turnId === older.id);
+    expect(firstOlderCall).toBeDefined();
+
+    clickTurnHeader("turn-old");
+    await waitFor(() => expect(firstOlderCall?.[4]?.aborted).toBe(true));
+    expect(outerTurnPanel("turn-old")).not.toHaveClass("ant-collapse-item-active");
+
+    clickTurnHeader("turn-old");
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      older.session_id, older.thread_id, "turn-old", 1, expect.any(AbortSignal), undefined,
+    ));
+    expect(olderCalls).toBe(2);
+    expect(screen.getAllByText("System")).toHaveLength(2);
+  });
+
+  it("aborts the previous version request before loading the selected version", async () => {
+    const latest = turn("turn-new", "2026-08-28T00:00:00Z");
+    vi.mocked(getTurnTrace).mockImplementation(
+      async (_sessionId, _threadId, _turnId, dataIdx, signal) => {
+        if (dataIdx === 0) return response(latest, dataIdx);
+        return new Promise<TurnTraceResponse>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    );
+    render(<AntApp><TracePage turns={[latest]} /></AntApp>);
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledTimes(1));
+    const firstSignal = vi.mocked(getTurnTrace).mock.calls[0][4];
+
+    fireEvent.click(screen.getByRole("button", { name: "turn-new 上一个 data 版本" }));
+
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+    await waitFor(() => expect(getTurnTrace).toHaveBeenLastCalledWith(
+      latest.session_id, latest.thread_id, latest.id, 0, expect.any(AbortSignal), undefined,
+    ));
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+  });
+
+  it("stops scheduled polling when a running Turn is collapsed", async () => {
+    vi.useFakeTimers();
+    const running = turn("turn-running", "2026-08-28T00:00:00Z", "running");
+    vi.mocked(getTurnTrace).mockResolvedValue(response(running, 1));
+    render(<AntApp><TracePage turns={[running]} /></AntApp>);
+    await act(async () => Promise.resolve());
+    await act(async () => Promise.resolve());
+    expect(getTurnTrace).toHaveBeenCalledTimes(1);
+
+    clickTurnHeader("turn-running");
+    await act(async () => Promise.resolve());
+    await act(async () => {
+      vi.advanceTimersByTime(6_000);
+      await Promise.resolve();
+    });
+
+    expect(outerTurnPanel("turn-running")).not.toHaveClass("ant-collapse-item-active");
+    expect(getTurnTrace).toHaveBeenCalledTimes(1);
+  });
+
+  it("isolates a failed Turn while another expanded Turn loads normally", async () => {
+    const older = turn("turn-old", "2026-08-27T00:00:00Z");
+    const latest = turn("turn-new", "2026-08-28T00:00:00Z");
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, turnId, dataIdx) => {
+      if (turnId === latest.id) throw new Error("latest unavailable");
+      return response(older, dataIdx);
+    });
+    render(<AntApp><TracePage turns={[older, latest]} /></AntApp>);
+
+    expect(await screen.findByText("latest unavailable")).toBeInTheDocument();
+    clickTurnHeader("turn-old");
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      older.session_id, older.thread_id, "turn-old", 1, expect.any(AbortSignal), undefined,
+    ));
+    expect(screen.getByText("System")).toBeInTheDocument();
+    expect(screen.getByText("latest unavailable")).toBeInTheDocument();
+  });
+
+  it("marks outer and inner Collapse titles for single-line truncation", async () => {
+    const longTurnId = `turn-${"x".repeat(180)}`;
+    const longPreview = `system-${"very-long-trace-content-".repeat(40)}`;
+    const latest = turn(longTurnId, "2026-08-28T00:00:00Z");
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, _turnId, dataIdx) => {
+      const value = response(latest, dataIdx);
+      value.context!.system_message = longPreview;
+      return value;
+    });
+    const { container } = render(<AntApp><TracePage turns={[latest]} /></AntApp>);
+
+    await waitFor(() => expect(screen.getByTitle(longPreview)).toBeInTheDocument());
+    const semanticTitles = container.querySelectorAll(".trace-collapse-title");
+    expect(semanticTitles.length).toBeGreaterThan(1);
+    expect(screen.getByTitle(longTurnId)).toHaveClass("trace-turn-id");
+    expect(screen.getByTitle(longPreview)).toHaveClass("trace-preview");
+  });
+
+  it("keeps the baseline and merges only incremental Items until the Turn finishes", async () => {
+    vi.useFakeTimers();
+    const running = turn("turn-running", "2026-08-28T00:00:00Z", "running");
+    const finished = { ...running, status: "success" as const };
+    const initial = response(running, 1, {
+      items: [traceItem(1, 0, 0, "user", { type: "text", text: "question-1", status: "success" })],
+    });
+    const incremental = response(finished, 1, {
+      context: false,
+      items: [traceItem(2, 1, 0, "assistant", { type: "text", text: "incremental answer", status: "success" })],
+    });
+    vi.mocked(getTurnTrace).mockResolvedValueOnce(initial).mockResolvedValue(incremental);
+    const { rerender } = render(<AntApp><TracePage turns={[running]} /></AntApp>);
+    await act(async () => Promise.resolve());
+    expect(screen.getByText("System")).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+      await Promise.resolve();
+    });
+    await act(async () => Promise.resolve());
+    expect(getTurnTrace).toHaveBeenLastCalledWith(
+      running.session_id, running.thread_id, "turn-running", 1, expect.any(AbortSignal), 1,
+    );
+    expect(screen.getByText("System")).toBeInTheDocument();
+    expect(screen.getByTitle("question-1")).toBeInTheDocument();
+    expect(screen.getByTitle("incremental answer")).toBeInTheDocument();
+    rerender(<AntApp><TracePage turns={[finished]} /></AntApp>);
+    await act(async () => Promise.resolve());
+    expect(getTurnTrace).toHaveBeenCalledTimes(3);
+    expect(getTurnTrace).toHaveBeenLastCalledWith(
+      running.session_id, running.thread_id, "turn-running", 1, expect.any(AbortSignal), 2,
+    );
+    const terminalCallCount = vi.mocked(getTurnTrace).mock.calls.length;
+
+    await act(async () => {
+      vi.advanceTimersByTime(6_000);
+      await Promise.resolve();
+    });
+    expect(getTurnTrace).toHaveBeenCalledTimes(terminalCallCount);
+  });
+
+  it("retries a full baseline while the first decision has not initialized context", async () => {
+    vi.useFakeTimers();
+    const running = turn("turn-running", "2026-08-28T00:00:00Z", "running");
+    vi.mocked(getTurnTrace)
+      .mockResolvedValueOnce({ context: null, items: [], last_sequence: 0 })
+      .mockResolvedValue(response({ ...running, status: "success" }, 1));
+    render(<AntApp><TracePage turns={[running]} /></AntApp>);
+    await act(async () => Promise.resolve());
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+      await Promise.resolve();
+    });
+    await act(async () => Promise.resolve());
+    expect(getTurnTrace).toHaveBeenLastCalledWith(
+      running.session_id, running.thread_id, "turn-running", 1, expect.any(AbortSignal), undefined,
+    );
+    expect(screen.getByText("System")).toBeInTheDocument();
+  });
+
+  it("resets to only the latest Turn when the keyed Trace page switches Threads", async () => {
+    const firstOlder = turn("first-old", "2026-08-27T00:00:00Z");
+    const firstLatest = turn("first-new", "2026-08-28T00:00:00Z");
+    const secondOlder = { ...turn("second-old", "2026-08-27T00:00:00Z"), thread_id: "thread-b" };
+    const secondLatest = { ...turn("second-new", "2026-08-28T00:00:00Z"), thread_id: "thread-b" };
+    vi.mocked(getTurnTrace).mockImplementation(async (_sessionId, _threadId, turnId, dataIdx) => response(
+      [firstOlder, firstLatest, secondOlder, secondLatest].find((candidate) => candidate.id === turnId)!,
+      dataIdx,
+    ));
+    const { rerender } = render(
+      <AntApp><TracePage key="thread-a" turns={[firstOlder, firstLatest]} /></AntApp>,
+    );
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      firstLatest.session_id, firstLatest.thread_id, "first-new", 1, expect.any(AbortSignal), undefined,
+    ));
+    clickTurnHeader("first-old");
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      firstOlder.session_id, firstOlder.thread_id, "first-old", 1, expect.any(AbortSignal), undefined,
+    ));
+
+    rerender(<AntApp><TracePage key="thread-b" turns={[secondLatest, secondOlder]} /></AntApp>);
+
+    await waitFor(() => expect(getTurnTrace).toHaveBeenCalledWith(
+      secondLatest.session_id, secondLatest.thread_id, "second-new", 1, expect.any(AbortSignal), undefined,
+    ));
+    expect(outerTurnPanel("second-old")).not.toHaveClass("ant-collapse-item-active");
+    expect(outerTurnPanel("second-new")).toHaveClass("ant-collapse-item-active");
+    expect(vi.mocked(getTurnTrace).mock.calls.some(([, , turnId]) => turnId === "second-old")).toBe(false);
+  });
+});

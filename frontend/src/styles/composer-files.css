@@ -1,0 +1,77 @@
+.composer-references,
+.composer-uploads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 4px 0;
+}
+
+.composer-reference,
+.composer-upload {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+  font-size: 12.5px;
+}
+
+.composer-reference-path,
+.composer-upload-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-reference-remove,
+.composer-upload-remove {
+  flex-shrink: 0;
+  padding: 0 2px;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.composer-upload-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  object-fit: cover;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.composer-upload-icon {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+
+.composer-upload-progress {
+  width: 56px;
+  margin: 0;
+}
+
+.composer-upload.status-error {
+  border-color: var(--error-border);
+  background: var(--error-bg);
+}
+
+.composer-upload-error {
+  color: var(--error);
+  font-size: 12px;
+}
+
+.composer-box.is-dragging {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.history-empty,
+.empty-state {
+  padding: 20px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}

@@ -1,0 +1,232 @@
+"""Execution-budget regression tests."""
+
+from __future__ import annotations
+
+import pytest
+
+from backend.domain import (
+    AssistantMessage,
+    RunState,
+    ToolMessage,
+)
+from backend.planning import LLMPlanner
+from backend.runtime import LegacyAgentRunner as AgentRunner
+from backend.runtime import PreparedResponse, RunnerSettings, RuntimeState
+from backend.runtime.execution.workflows.budgets import _tool_batch_fits
+from backend.tools import Tool, ToolRegistry
+
+
+class BatchedPlanner:
+    name = "batched"
+
+    def __init__(self, batches: list[int], answer: str = "Project summary") -> None:
+        self.batches = batches
+        self.answer = answer
+        self.decisions = 0
+        self.finalizations = 0
+        self._next_call = 0
+
+    def decide(self, runtime) -> AssistantMessage:
+        del runtime
+        index = self.decisions
+        self.decisions += 1
+        if index >= len(self.batches):
+            return AssistantMessage(content=self.answer)
+        tools = []
+        for _ in range(self.batches[index]):
+            self._next_call += 1
+            tools.append(ToolMessage(name="inspect", call_id=f"call_{self._next_call}"))
+        return AssistantMessage(tool_messages=tools)
+
+    def finalize(self, runtime, reason: str) -> AssistantMessage:
+        del runtime, reason
+        self.finalizations += 1
+        return AssistantMessage(content="Useful budget summary")
+
+
+class NoFinalizerPlanner:
+    name = "no-finalizer"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def decide(self, runtime) -> AssistantMessage:
+        del runtime
+        self.calls += 1
+        return AssistantMessage(tool_messages=[ToolMessage(name="inspect", call_id=f"call_{self.calls}")])
+
+
+class BrokenFinalizerPlanner(NoFinalizerPlanner):
+    name = "broken-finalizer"
+
+    def finalize(self, runtime, reason: str) -> AssistantMessage:
+        del runtime, reason
+        raise RuntimeError("provider unavailable")
+
+
+def registry(calls: list[str] | None = None) -> ToolRegistry:
+    recorded = calls if calls is not None else []
+    return ToolRegistry([Tool("inspect", "Inspect", lambda: recorded.append("inspect") or "ok")])
+
+
+def test_default_budget_allows_one_plus_four_plus_six_plan_reads_then_answer() -> None:
+    planner = BatchedPlanner([1, 4, 6])
+    state = AgentRunner(planner, registry()).run("Read the project", mode="plan")
+
+    assert state.status == "completed"
+    assert state.final_answer == "Project summary"
+    assert len(state.actions) == 11
+    assert state.model_turns == 4
+    assert planner.decisions == 4
+    assert planner.finalizations == 0
+
+
+def test_default_tool_budget_accepts_exactly_512_calls() -> None:
+    runtime = AgentRunner(BatchedPlanner([]), registry()).new_runtime(task="Inspect")
+    exact = AssistantMessage(
+        tool_messages=[ToolMessage(name="inspect", call_id=f"call_{index}") for index in range(512)]
+    )
+    over = AssistantMessage(
+        tool_messages=[ToolMessage(name="inspect", call_id=f"over_{index}") for index in range(513)]
+    )
+
+    assert _tool_batch_fits(runtime, exact) is True
+    assert _tool_batch_fits(runtime, over) is False
+
+
+def test_over_budget_tool_batch_is_rejected_atomically_and_finalized() -> None:
+    calls: list[str] = []
+    events = []
+    planner = BatchedPlanner([3])
+    state = AgentRunner(
+        planner,
+        registry(calls),
+        max_tool_calls=2,
+    ).run("Inspect", on_event=events.append)
+
+    assert state.status == "failed"
+    assert state.final_answer == "Useful budget summary"
+    assert state.actions == []
+    assert calls == []
+    rejected = next(
+        message for message in state.history if isinstance(message, AssistantMessage) and message.tool_messages
+    )
+    assert all(tool.status == "failed" for tool in rejected.tool_messages)
+    error = next(event for event in reversed(events) if event.kind == "error")
+    assert error.data["limit_type"] == "tool_calls"
+    assert error.data["limit"] == 2
+    assert error.data["tool_calls"] == 0
+    assert error.data["finalizer"] == "planner"
+
+
+def test_model_turns_are_metrics_without_a_model_turn_budget() -> None:
+    planner = BatchedPlanner([1, 1])
+    state = AgentRunner(
+        planner,
+        registry(),
+    ).run("Inspect")
+
+    assert state.status == "completed"
+    assert state.model_turns == 3
+    assert len(state.actions) == 2
+    assert planner.decisions == 3
+    assert planner.finalizations == 0
+    assert state.final_answer == "Project summary"
+
+
+@pytest.mark.parametrize("planner", [NoFinalizerPlanner(), BrokenFinalizerPlanner()])
+def test_budget_finalization_has_a_deterministic_fallback(planner) -> None:
+    events = []
+    state = AgentRunner(
+        planner,
+        registry(),
+        max_tool_calls=1,
+    ).run("Inspect", on_event=events.append)
+
+    assert state.status == "failed"
+    assert state.final_answer is not None
+    assert "Execution budget exhausted" in state.final_answer
+    error = next(event for event in reversed(events) if event.kind == "error")
+    assert error.data["finalizer"] == "fallback"
+    if isinstance(planner, BrokenFinalizerPlanner):
+        assert error.data["finalization_error"] == "provider unavailable"
+
+
+def test_settings_serialize_new_budgets_and_load_legacy_max_actions() -> None:
+    state = RuntimeState(
+        session_id="session_budget",
+        runner_settings=RunnerSettings(max_tool_calls=7, max_tool_parellel=64),
+    )
+    payload = state.to_dict()
+
+    assert payload["runner_settings"]["max_tool_calls"] == 7
+    assert payload["runner_settings"]["max_tool_parellel"] == 64
+    assert "max_actions" not in payload["runner_settings"]
+
+    payload["runner_settings"] = {
+        "max_actions": 5,
+        "max_retries": 1,
+        "max_tool_recoveries": 2,
+        "max_model_repairs": 3,
+        "max_model_turns": 4,
+        "max_replans": 5,
+    }
+    restored = RuntimeState.from_dict(payload)
+    assert restored.runner_settings.max_tool_calls == 5
+    assert restored.runner_settings.max_tool_parellel == 16
+    assert restored.runner_settings.max_transport_retries == 5
+    assert not any(
+        hasattr(restored.runner_settings, name)
+        for name in (
+            "max_retries",
+            "max_tool_recoveries",
+            "max_model_repairs",
+            "max_model_turns",
+            "max_replans",
+            "max_actions",
+        )
+    )
+
+
+def test_run_state_explicit_counters_round_trip_and_default_to_zero() -> None:
+    state = RunState(task="Inspect", mode="agent", model_turns=3, model_calls=4, tool_calls=5, retries=2)
+    assert RunState.from_dict(state.to_dict()).model_turns == 3
+    restored = RunState.from_dict(state.to_dict())
+    assert (restored.model_calls, restored.tool_calls, restored.retries) == (4, 5, 2)
+
+    payload = state.to_dict()
+    for key in ("model_turns", "model_calls", "tool_calls", "retries"):
+        payload.pop(key)
+    restored = RunState.from_dict(payload)
+    assert (restored.model_turns, restored.model_calls, restored.tool_calls, restored.retries) == (0, 0, 0, 0)
+
+
+def test_deleted_tool_budget_arguments_are_not_public_contract() -> None:
+    with pytest.raises(TypeError):
+        RunnerSettings(max_actions=4, max_tool_calls=4)
+    with pytest.raises(TypeError):
+        AgentRunner(NoFinalizerPlanner(), registry(), max_actions=4, max_tool_calls=4)
+
+
+def test_llm_finalizer_uses_text_mode_without_tools() -> None:
+    class CaptureClient:
+        def __init__(self) -> None:
+            self.request = None
+
+        def run(self, runtime):
+            self.request = (
+                runtime.exchange.operation,
+                runtime.exchange.output_mode,
+                list(runtime.exchange.allowed_tools),
+            )
+            return PreparedResponse(AssistantMessage(content="Bounded summary"))
+
+    client = CaptureClient()
+    planner = LLMPlanner(client, ["inspect"], ["inspect"])
+    runner = AgentRunner(NoFinalizerPlanner(), registry())
+    runtime = runner.new_runtime(task="Inspect")
+
+    message = planner.finalize(runtime, "tool budget exhausted")
+
+    assert message.content == "Bounded summary"
+    assert client.request == ("finalize", "text", [])

@@ -1,0 +1,169 @@
+import { useState } from "react";
+import { Button, Card, Input, Radio, Space } from "antd";
+import {
+  FileTextOutlined,
+  QuestionCircleOutlined,
+  ReloadOutlined,
+  SafetyCertificateOutlined,
+} from "@ant-design/icons";
+import type { DecisionRequest } from "../types";
+import MarkdownContent from "./MarkdownContent";
+import PlanFileContent from "./PlanFileContent";
+import { saveSessionFilePanels } from "./rightPanel/filePanelLifecycle";
+
+interface Props {
+  sessionId?: string;
+  threadId?: string;
+  showPlan?: boolean;
+  request: DecisionRequest;
+  onSubmit: (choice: string, options?: { supplement?: string; answers?: Record<string, string[]> }) => Promise<void>;
+}
+
+/**
+ * Renders the four decision protocols emitted by the runtime. The choice
+ * strings intentionally stay identical to the backend contract; only the
+ * presentation controls are provided by Ant Design.
+ */
+export default function DecisionCard({ request, onSubmit, sessionId, threadId, showPlan = true }: Props) {
+  const [submitting, setSubmitting] = useState(false);
+  const [answers, setAnswers] = useState<Record<string, string[]>>({});
+  const [saveError, setSaveError] = useState("");
+
+  async function submit(choice: string, options: { supplement?: string; answers?: Record<string, string[]> } = {}) {
+    setSubmitting(true);
+    try {
+      if (request.kind === "plan" && sessionId && !await saveSessionFilePanels(sessionId)) {
+        setSaveError("计划文件保存失败，请先处理右侧编辑器中的错误。");
+        return;
+      }
+      setSaveError("");
+      await onSubmit(choice, options);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (request.kind === "plan") {
+    const proposal = request.plan || (request.steps ?? []).map((step, index) => `${index + 1}. ${step}`).join("\n");
+    return (
+      <Card className="decision-card plan-decision" size="small" title={<><FileTextOutlined /> Plan Review</>}>
+        {showPlan ? sessionId && request.plan_path ? <PlanFileContent sessionId={sessionId} threadId={threadId} path={request.plan_path} /> : proposal ? <MarkdownContent text={proposal} /> : <p>{request.message || "Agent 请求审核一个计划。"}</p> : null}
+        {saveError ? <p role="alert">{saveError}</p> : null}
+        <Space className="decision-actions" wrap>
+          <Button autoInsertSpace={false} type="primary" loading={submitting} disabled={submitting} onClick={() => void submit("implement")}>实施</Button>
+          <Button autoInsertSpace={false} type="primary" loading={submitting} disabled={submitting} onClick={() => void submit("implement_and_compaction")}>压缩后实施</Button>
+          <Button autoInsertSpace={false} loading={submitting} disabled={submitting} onClick={() => void submit("stay_in_plan_mode")}>留在 Plan</Button>
+        </Space>
+      </Card>
+    );
+  }
+
+  if (request.kind === "question") {
+    const questions = request.questions ?? [];
+    return (
+      <Card className="decision-card question-decision" size="small" title={<><QuestionCircleOutlined /> Agent 需要你的回答</>}>
+        {questions.map((question) => {
+          const answer = answers[question.id]?.[0] ?? "";
+          const knownOption = question.options.some((option) => option.label === answer);
+          return (
+            <div className="question-block" key={question.id}>
+              <strong>{question.header || "问题"}</strong>
+              <p>{question.question}</p>
+              <Radio.Group
+                className="question-options"
+                value={knownOption ? answer : undefined}
+                onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: [event.target.value] }))}
+              >
+                <Space orientation="vertical" size={6}>
+                  {question.options.map((option) => (
+                    <Radio disabled={submitting} value={option.label} key={option.label}>
+                      <span>{option.label}</span>
+                      {option.description ? <small>{option.description}</small> : null}
+                    </Radio>
+                  ))}
+                </Space>
+              </Radio.Group>
+              <Input
+                className="question-other-input"
+                placeholder="其他回答（可选）"
+                value={knownOption ? "" : answer}
+                onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: [event.target.value] }))}
+                disabled={submitting}
+              />
+            </div>
+          );
+        })}
+        <Space className="decision-actions" wrap>
+          <Button
+            autoInsertSpace={false}
+            type="primary"
+            loading={submitting}
+            disabled={submitting || questions.some((question) => !(answers[question.id]?.[0] || "").trim())}
+            onClick={() => void submit("answer", { answers })}
+          >
+            提交回答
+          </Button>
+        </Space>
+      </Card>
+    );
+  }
+
+  if (request.kind === "resume") {
+    return (
+      <Card className="decision-card" size="small" title={<><ReloadOutlined /> 恢复运行</>}>
+        {request.details ? <pre>{request.details}</pre> : <p>{request.message || "是否继续这个持久运行？"}</p>}
+        <Space className="decision-actions" wrap>
+          <Button autoInsertSpace={false} type="primary" loading={submitting} disabled={submitting} onClick={() => void submit("continue")}>继续</Button>
+          <Button autoInsertSpace={false} loading={submitting} disabled={submitting} onClick={() => void submit("back")}>返回</Button>
+        </Space>
+      </Card>
+    );
+  }
+
+  if (request.kind === "skill") {
+    return (
+      <Card className="decision-card skill-decision" size="small" title={<><SafetyCertificateOutlined /> 项目 Skill 信任审批</>}>
+        <p>{request.message || "这个项目 Skill 尚未被信任。"}</p>
+        <strong className="mono">{request.skill || "unknown-skill"}</strong>
+        {request.description ? <p>{request.description}</p> : null}
+        {request.path ? (
+          <p className="muted">
+            项目路径：<code>{request.path}</code>
+          </p>
+        ) : null}
+        {request.tree_sha256 ? (
+          <p className="muted">
+            目录指纹（SHA-256）：<code>{request.tree_sha256}</code>
+          </p>
+        ) : null}
+        <p className="muted">
+          信任只针对当前目录内容。Skill 中的脚本、引用或资料发生变化后需要重新审批。
+        </p>
+        <Space className="decision-actions" wrap>
+          <Button autoInsertSpace={false} type="primary" loading={submitting} disabled={submitting} onClick={() => void submit("trust")}>信任这个 Skill</Button>
+          <Button autoInsertSpace={false} loading={submitting} disabled={submitting} onClick={() => void submit("skip")}>本次跳过</Button>
+        </Space>
+      </Card>
+    );
+  }
+
+  const shownArguments =
+    typeof request.arguments === "string" ? request.arguments : JSON.stringify(request.arguments ?? {}, null, 2);
+  const escalation = request.approval_kind === "sandbox_escalation";
+  return (
+    <Card className="decision-card tool-decision" size="small" title={<><SafetyCertificateOutlined /> {escalation ? "工具提权" : "工具审批"}</>}>
+      <p>{escalation
+        ? "命令遇到权限拒绝。允许使用当前 Windows 用户权限，在沙箱外重新执行一次吗？这将允许访问工作区外文件和网络，但不会申请管理员权限。之前已完成的操作可能重复执行。"
+        : request.message || `请求调用 ${request.tool || "工具"}`}</p>
+      {request.tool ? <strong className="mono">{request.tool}</strong> : null}
+      <pre>{shownArguments}</pre>
+      {escalation && request.cwd ? <p className="muted">工作目录：<code>{request.cwd}</code></p> : null}
+      {escalation && request.details ? <details><summary>第一次运行的错误</summary><pre>{request.details}</pre></details> : null}
+      <Space className="decision-actions" wrap>
+        <Button autoInsertSpace={false} type="primary" loading={submitting} disabled={submitting} onClick={() => void submit("allow_once")}>{escalation ? "提权并重试一次" : "本次允许"}</Button>
+        {!escalation ? <Button autoInsertSpace={false} loading={submitting} disabled={submitting} onClick={() => void submit("allow_session")}>本会话允许</Button> : null}
+        <Button autoInsertSpace={false} danger disabled={submitting} onClick={() => void submit("deny")}>拒绝</Button>
+      </Space>
+    </Card>
+  );
+}

@@ -1,0 +1,300 @@
+"""Normalize runtime events into durable, secret-safe diagnostic records."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from collections.abc import Mapping
+from typing import Any
+
+from backend.domain import (
+    ToolSpec,
+    error_report,
+    message_to_dict,
+    normalize_error_report,
+    redact_sensitive_text,
+    safe_error_message,
+)
+
+from ..core.context import PreparedResponse, RuntimeExchange, RuntimeState
+from ..core.events import RuntimeEvent
+
+_SENSITIVE_KEY = re.compile(
+    r"(?:api[_-]?key|authorization|cookie|password|secret|token)",
+    re.IGNORECASE,
+)
+_IDENTIFIER_KEYS = frozenset(
+    {
+        "attempt",
+        "call_id",
+        "exchange_id",
+        "error_type",
+        "finish_reason",
+        "incomplete_reason",
+        "hook",
+        "kind",
+        "mode",
+        "lifecycle",
+        "model",
+        "name",
+        "operation",
+        "output_mode",
+        "planner",
+        "provider",
+        "phase",
+        "response_id",
+        "response_model",
+        "role",
+        "run_id",
+        "workflow_id",
+        "workflow_attempt",
+        "workflow_trigger",
+        "workspace_root",
+        "project_cwd",
+        "source_session_id",
+        "source_run_id",
+        "session_id",
+        "source",
+        "status",
+        "trigger",
+        "stream",
+        "tool",
+    }
+)
+_PREVIEW_CHARS = 200
+LOG_SCHEMA_VERSION = 2
+_TRACE_OMITTED_KEYS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "header",
+        "headers",
+        "provider_wire_request",
+        "provider_wire_response",
+        "wire_request",
+        "wire_response",
+    }
+)
+
+
+def model_request_data(state: RuntimeState, exchange: RuntimeExchange) -> dict[str, Any]:
+    """Return provider-neutral data needed to replay a prepared model request."""
+
+    parameters = dict(state.request_parameters)
+    snapshot = exchange.context.get("runtime_config_snapshot")
+    if isinstance(snapshot, Mapping) and isinstance(snapshot.get("request_parameters"), Mapping):
+        parameters = dict(snapshot["request_parameters"])
+    overrides = exchange.context.get("request_parameters")
+    if isinstance(overrides, Mapping):
+        parameters.update(overrides)
+    data: dict[str, Any] = {
+        "schema_version": LOG_SCHEMA_VERSION,
+        "exchange_id": exchange.exchange_id,
+        "operation": exchange.operation,
+        "provider": state.provider,
+        "model": parameters.get("model") or state.model,
+        "output_mode": exchange.output_mode,
+        "stream": exchange.stream,
+        "request_parameters": parameters,
+        "messages": [_message_to_record(message) for message in exchange.messages],
+        "tools": [_tool_spec_to_dict(tool) for tool in exchange.allowed_tools],
+    }
+    if exchange.wire_request is not None:
+        data["wire_request"] = exchange.wire_request
+    if exchange.transport_metadata:
+        data["transport"] = dict(exchange.transport_metadata)
+    return data
+
+
+def model_response_data(state: RuntimeState, exchange: RuntimeExchange, response: PreparedResponse) -> dict[str, Any]:
+    """Return both normalized response data and the complete provider wire body."""
+
+    data: dict[str, Any] = {
+        "schema_version": LOG_SCHEMA_VERSION,
+        "exchange_id": exchange.exchange_id,
+        "provider": state.provider,
+        "model": state.model,
+        "response_id": response.response_id,
+        "response_model": response.model,
+        "finish_reason": response.finish_reason,
+        "incomplete_reason": response.incomplete_reason,
+        "usage": response.usage,
+        "message": _message_to_record(response.message),
+    }
+    # ``TokenUsageTracker`` reconciles provider usage (or a local tiktoken
+    # estimate when the provider omitted usage) before this event is emitted.
+    # Keep that canonical five-field projection alongside the raw provider
+    # payload so the message-tree bridge can update the dynamic assistant even
+    # when ``response.usage`` is ``None``.
+    node_usage = exchange.context.get("node_usage")
+    if isinstance(node_usage, Mapping):
+        data["node_usage"] = dict(node_usage)
+    token_usage = state.token_usage.get("requests", {}).get(exchange.exchange_id)
+    if isinstance(token_usage, dict):
+        data["usage_accounting"] = dict(token_usage)
+    if exchange.wire_response is not None:
+        data["wire_response"] = exchange.wire_response
+    if exchange.transport_metadata:
+        data["transport"] = dict(exchange.transport_metadata)
+    return data
+
+
+def model_error_data(state: RuntimeState, exchange: RuntimeExchange, error: Exception) -> dict[str, Any]:
+    """Capture safe diagnostics and any wire data available before the failure."""
+
+    diagnostics = getattr(error, "diagnostics", None)
+    data: dict[str, Any] = {
+        "schema_version": LOG_SCHEMA_VERSION,
+        "exchange_id": exchange.exchange_id,
+        "provider": state.provider,
+        "model": state.model,
+        "operation": exchange.operation,
+        "error_type": error.__class__.__name__,
+        "error": safe_error_message(error),
+        "error_report": error_report(error),
+        "diagnostics": dict(diagnostics) if isinstance(diagnostics, dict) else {},
+    }
+    if exchange.wire_request is not None:
+        data["wire_request"] = exchange.wire_request
+    token_usage = state.token_usage.get("requests", {}).get(exchange.exchange_id)
+    if isinstance(token_usage, dict):
+        data["usage_accounting"] = dict(token_usage)
+    if exchange.wire_response is not None:
+        data["wire_response"] = exchange.wire_response
+    if exchange.transport_metadata:
+        data["transport"] = dict(exchange.transport_metadata)
+    return data
+
+
+def persistent_event(event: RuntimeEvent, include_full_messages: bool) -> tuple[str, dict[str, Any]]:
+    """Create the data representation shared by checkpoints and JSONL logs."""
+
+    message = _redact_text(event.message)
+    if not include_full_messages and message:
+        message = _summary_label(message)
+    return message, _persistent_value(event.data, include_full_messages)
+
+
+def _tool_spec_to_dict(tool: ToolSpec) -> dict[str, Any]:
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+    }
+
+
+def _message_to_record(message: Any) -> dict[str, Any]:
+    """Serialize the neutral message contract without provider wire extensions."""
+
+    payload = message_to_dict(message)
+    payload.pop("provider_options", None)
+    tools = payload.get("tool_messages")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                tool.pop("provider_options", None)
+    return payload
+
+
+def neutral_message_record(message: Any) -> dict[str, Any]:
+    """Serialize one provider-neutral message without provider wire extensions."""
+
+    return _message_to_record(message)
+
+
+def redact_audit_value(value: Any) -> Any:
+    """Recursively redact secrets while retaining complete audit-safe content."""
+
+    return _persistent_value(value, True)
+
+
+def turn_trace_audit_value(value: Any) -> Any:
+    """Drop forbidden transport fields, then recursively redact audit content."""
+
+    if isinstance(value, Mapping):
+        filtered: dict[str, Any] = {}
+        for raw_key, item_value in value.items():
+            key = str(raw_key)
+            normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", key).replace("-", "_").casefold()
+            if normalized in _TRACE_OMITTED_KEYS:
+                continue
+            filtered[key] = turn_trace_audit_value(item_value)
+        return _persistent_value(filtered, True)
+    if isinstance(value, (list, tuple)):
+        return [turn_trace_audit_value(item) for item in value]
+    return _persistent_value(value, True)
+
+
+def _persistent_value(value: Any, include_full_messages: bool, key: str | None = None) -> Any:
+    if key == "error_report":
+        return normalize_error_report(value)
+    if (
+        key is not None
+        and _SENSITIVE_KEY.search(key)
+        and not (
+            (value is None or isinstance(value, (int, float)) and not isinstance(value, bool))
+            and key
+            in {
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "cached_input_tokens",
+                "estimated_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "estimated_tokens_before",
+                "estimated_tokens_after",
+                "target_tokens",
+                "estimated_input_tokens",
+                "max_tokens",
+                "max_output_tokens",
+                "max_completion_tokens",
+            }
+            or isinstance(value, Mapping)
+            and key
+            in {
+                "input_tokens_details",
+                "output_tokens_details",
+                "prompt_tokens_details",
+                "completion_tokens_details",
+            }
+        )
+    ):
+        return "[REDACTED]"
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _persistent_value(item_value, include_full_messages, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_persistent_value(item, include_full_messages) for item in value]
+    if isinstance(value, tuple):
+        return [_persistent_value(item, include_full_messages) for item in value]
+    if isinstance(value, str):
+        redacted = _redact_text(value)
+        if include_full_messages or key in _IDENTIFIER_KEYS:
+            return redacted
+        return _text_summary(redacted)
+    return value
+
+
+def _redact_text(value: str) -> str:
+    return redact_sensitive_text(value)
+
+
+def _summary_label(value: str) -> str:
+    return f"{len(value)} chars; sha256={hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def _text_summary(value: str) -> dict[str, Any]:
+    return {
+        "preview": value[:_PREVIEW_CHARS],
+        "chars": len(value),
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+    }

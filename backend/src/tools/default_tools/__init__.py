@@ -1,0 +1,48 @@
+"""Factories for the standard workspace tool catalog."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from backend.domain.terminal import DEFAULT_TERMINAL_TYPE, TerminalType
+
+from ..base import Tool
+from ..command import WorkspaceCommand
+from ..filesystem import WorkspaceFiles
+from ..web import DdgrWebSearch, SafeWebFetcher
+from .command import command_tool, stdin_tool
+from .filesystem import filesystem_mutation_tools, filesystem_read_tools
+from .time import time_tools
+from .todo import todo_tools
+from .web import web_tools
+
+
+def build_default_tools(
+    workspace: Path,
+    *,
+    files: WorkspaceFiles | None = None,
+    search: DdgrWebSearch | None = None,
+    fetcher: SafeWebFetcher | None = None,
+    project_workspace: Path | None = None,
+    terminal_type: TerminalType | str = DEFAULT_TERMINAL_TYPE,
+) -> tuple[Tool, ...]:
+    """Build tools in the stable order exposed to planners."""
+
+    workspace_files = files or WorkspaceFiles(workspace, project_workspace=project_workspace)
+    commands = WorkspaceCommand(project_workspace or workspace, terminal_type=terminal_type)
+    tools = [
+        *time_tools(),
+        *todo_tools(),
+        *filesystem_read_tools(workspace_files),
+        *web_tools(
+            search or DdgrWebSearch(),
+            fetcher or SafeWebFetcher(),
+        ),
+        *filesystem_mutation_tools(workspace_files),
+        command_tool(commands),
+        stdin_tool(commands),
+    ]
+    return tuple(tools)
+
+
+__all__ = ["build_default_tools"]

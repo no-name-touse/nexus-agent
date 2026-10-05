@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Start the local client tiers independently.
+#
+#   scripts/dev.sh backend   # server  -> http://127.0.0.1:8000
+#   scripts/dev.sh frontend  # client  -> http://localhost:5173
+#   scripts/dev.sh all       # backend + frontend together
+#
+# Model config defaults to ~/.praxis/config.toml; override with PRAXIS_CONFIG.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+CONFIG="${PRAXIS_CONFIG:-$HOME/.praxis/config.toml}"
+
+start_backend() {
+  echo "[dev] backend server: http://127.0.0.1:8000  (config: $CONFIG)"
+  PRAXIS_CONFIG="$CONFIG" uv run python -m backend.api
+}
+
+start_frontend() {
+  echo "[dev] frontend client: http://localhost:5173"
+  (cd frontend && npm run dev)
+}
+
+case "${1:-all}" in
+  backend)
+    start_backend
+    ;;
+  frontend)
+    start_frontend
+    ;;
+  all)
+    echo "[dev] starting backend + frontend"
+    trap 'kill 0' EXIT INT TERM
+    start_backend &
+    sleep 1
+    start_frontend &
+    wait
+    ;;
+  *)
+    echo "usage: scripts/dev.sh [backend|frontend|all]"
+    exit 1
+    ;;
+esac

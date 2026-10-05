@@ -1,0 +1,670 @@
+"""Turn execution streaming, process-local coordination, and terminal delivery."""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import HTTPException
+
+from backend.domain import (
+    ClaimedEnvelope,
+    MessageQueueUnavailable,
+    error_report,
+    safe_error_message,
+    terminal_error_text,
+)
+from backend.domain.execution_config import TurnExecutionConfig
+from backend.domain.input_message import InputMessage
+from backend.domain.runtime_state import NodeFrame, NodeWriter, RuntimeState, terminal_error_payload
+from backend.jobs import AdmissionPolicy, JobLane, JobScopeKind, ThreadJob
+from backend.providers import ModelConfig, ModelConfigurationError
+from backend.runtime.node_bridge import RuntimeEventNodeBridge
+from backend.runtime.persistence.streaming import RuntimeFramePersistence
+from backend.sandbox import ApprovalStore
+from backend.storage.message_queue import AgentMailbox
+from backend.storage.settings.crypto import SecretDecryptionError
+
+from ..active_turn_stream import ActiveTurnStream
+from ..agent_report_projection import project_frame
+from ..pause_control import TurnPauseController
+from ..runtime_event_transport import publish_frame as publish_runtime_frame
+from ..runtime_event_transport import publish_terminal as publish_runtime_terminal
+from ..session_store import session_store as _store
+from ..state import WebAppState
+from .interrupts import make_interactive_interrupt
+from .models import _model_request_parameters
+from .titles import _auto_title_main_thread
+
+logger = logging.getLogger(__name__)
+
+
+def _terminal_type_for_status(status: str, category: str | None) -> Literal["success", "failed"]:
+    if status == "success" or (status == "paused" and category == "user"):
+        return "success"
+    return "failed"
+
+
+def _startup_failure_message(error: Exception) -> str:
+    """Render failures raised before a persisted Turn baseline exists."""
+
+    return safe_error_message(error)
+
+
+def _terminal_message_for_turn(
+    terminal_type: str,
+    terminal_error: Mapping[str, Any] | None,
+    *,
+    turn_id: str,
+    status: str,
+    category: str | None,
+    code: str,
+) -> str:
+    if terminal_type != "failed":
+        return ""
+    rendered = terminal_error_text(terminal_error) if terminal_error is not None else ""
+    if not rendered:
+        logger.warning(
+            "Turn failed without terminal error turn_id=%s status=%s category=%s code=%s",
+            turn_id,
+            status,
+            category or "",
+            code,
+        )
+    return rendered
+
+
+def _runtime_stream_lock_registry(state: object) -> dict[str, Any]:
+    """Return the process-local registry serializing work within one Thread."""
+
+    stream_locks = getattr(state, "active_runtime_stream_locks", None)
+    if (
+        not isinstance(stream_locks, dict)
+        or not isinstance(stream_locks.get("keys"), set)
+        or not hasattr(stream_locks.get("__lock__"), "__enter__")
+    ):
+        stream_locks = {"__lock__": threading.RLock(), "keys": set()}
+        setattr(state, "active_runtime_stream_locks", stream_locks)
+    return stream_locks
+
+
+def _stream(
+    state: WebAppState,
+    message: InputMessage | None,
+    *,
+    application_builder: Callable[..., Any],
+    session_id: str,
+    turn_id: str,
+    thread_id: str,
+    adopt_existing: bool = False,
+    precreated: bool = False,
+    source_node_id: str | None = None,
+    config: TurnExecutionConfig,
+    user_preferences: str = "",
+    model_config: ModelConfig | None = None,
+    operation: Callable[..., object] | None = None,
+    initial_delivery: ClaimedEnvelope | None = None,
+    subscribe: bool = True,
+):
+    mode = config.running_mode
+    permission_mode = config.permission_mode
+    provider_name = config.provider_name
+    request_model = config.model
+    reasoning_effort = request_model.reasoning_effort if request_model is not None else "medium"
+    model_snapshot = request_model.model_dump() if request_model is not None else None
+    prompt = message.text if message is not None else ""
+    # ``WebAppState`` owns these process-local registries in production, but
+    # callers such as focused SSE tests may provide a small state double.  A
+    # stream must remain self-contained in that case instead of failing in
+    # the worker after the response has already been opened.
+    active_runtime_configs = getattr(state, "active_runtime_configs", None)
+    if not isinstance(active_runtime_configs, dict):
+        active_runtime_configs = {}
+        setattr(state, "active_runtime_configs", active_runtime_configs)
+    active_runtime_bridges = getattr(state, "active_runtime_bridges", None)
+    if not isinstance(active_runtime_bridges, dict):
+        active_runtime_bridges = {}
+        setattr(state, "active_runtime_bridges", active_runtime_bridges)
+    # Reserve the Thread before creating the Job object.  Endpoint-level
+    # summary checks are advisory; this lock closes the two-window race where
+    # both requests otherwise pass validation and create two running leaves.
+    stream_locks = _runtime_stream_lock_registry(state)
+    stream_key = thread_id
+    reserved_stream_keys: set[str] = {stream_key}
+    stream_lock = stream_locks["__lock__"]
+    with stream_lock:
+        if stream_key in stream_locks["keys"]:
+            raise HTTPException(status_code=409, detail="当前 Thread 已有 running Turn。")
+        stream_locks["keys"].add(stream_key)
+
+    cache = getattr(state, "conversation_cache", None)
+    if cache is not None:
+        cache.begin(session_id, thread_id, turn_id)
+
+    def registry_key(active_thread_id: str) -> str:
+        return active_thread_id
+
+    active_turn_streams = getattr(state, "active_turn_streams", None)
+    if not isinstance(active_turn_streams, dict):
+        active_turn_streams = {}
+        setattr(state, "active_turn_streams", active_turn_streams)
+    active_turn_streams_lock = getattr(state, "active_turn_streams_lock", None)
+    if not hasattr(active_turn_streams_lock, "__enter__"):
+        active_turn_streams_lock = threading.RLock()
+        setattr(state, "active_turn_streams_lock", active_turn_streams_lock)
+    stream_store = _store(state)
+    active_stream = ActiveTurnStream(
+        turn_id,
+        lambda frame, current: project_frame(stream_store, frame, current),
+    )
+    active_stream_aliases: set[str] = {turn_id}
+    with active_turn_streams_lock:
+        active_turn_streams[turn_id] = active_stream
+    original_subscription = active_stream.subscribe(turn_id) if subscribe else None
+    cancel_requested = threading.Event()
+    pause_controller = TurnPauseController()
+    active_turn_cancellations = getattr(state, "active_turn_cancellations", None)
+    if not isinstance(active_turn_cancellations, dict):
+        active_turn_cancellations = {}
+        setattr(state, "active_turn_cancellations", active_turn_cancellations)
+    cancellation_key = turn_id
+    active_turn_cancellations[cancellation_key] = pause_controller
+    steering_inbox = AgentMailbox(
+        state.message_queue,
+        turn_id,
+        thread_id,
+        f"backend-{os.getpid()}-{threading.get_ident()}",
+    )
+
+    def take_steering():
+        return pause_controller.take_steering(steering_inbox.take)
+
+    job_registry = getattr(state, "job_registry", None)
+    job_holder: dict[str, ThreadJob | None] = {"job": None}
+    bridge_ref: dict[str, RuntimeEventNodeBridge | None] = {"bridge": None}
+    persistence_ref: dict[str, RuntimeFramePersistence | None] = {"worker": None}
+    pending_terminal: tuple[str, str, str] | None = None
+    initial_user_activity_recorded = False
+
+    def record_sidebar_activity(active_thread_id: str) -> None:
+        try:
+            stream_store.touch_sidebar_thread_activity(active_thread_id, session_id=session_id)
+        except KeyError:
+            # Right-panel side chats are Threads but do not have sidebar rows.
+            return
+        except Exception as exc:
+            logger.warning("Failed to update sidebar activity for thread %s: %s", active_thread_id, type(exc).__name__)
+
+    def cancellation_requested() -> bool:
+        if persistence_ref["worker"] is not None:
+            persistence_ref["worker"].check()
+        job = job_holder["job"]
+        if job is not None and job.is_cancelled():
+            cancel_requested.set()
+        return cancel_requested.is_set()
+
+    def suspension_requested() -> bool:
+        return pause_controller.is_requested()
+
+    def sink(item) -> None:
+        if cancellation_requested():
+            return
+        if pause_controller.is_requested() and getattr(item, "kind", "") not in {"cancelled", "run_suspended"}:
+            return
+        bridge = bridge_ref["bridge"]
+        if isinstance(item, dict):
+            if bridge is not None:
+                bridge.handle_input(item)
+            return
+        if bridge is not None:
+            # A PATCH updates the dynamic node immediately, but its runtime
+            # configuration is consumed only at an execution boundary.  Do
+            # not drain the process-local compatibility registry for ordinary
+            # stream events (response/thinking deltas): doing so would let a
+            # concurrent UI change alter the request that is already in
+            # flight.  ModelRequestExecutor and ToolStepExecutor are the
+            # authoritative consumers; this fallback is only for embedding
+            # callers that have not yet bound an AgentRuntime.
+            boundary_kinds = {
+                "model_request",
+                "tool_call",
+                "plan",
+            }
+            if getattr(item, "kind", "") in boundary_kinds:
+                locks = getattr(state, "active_runtime_config_locks", None)
+                key = registry_key(bridge.thread_id)
+                lock = locks.setdefault(key, threading.RLock()) if isinstance(locks, dict) else None
+                if lock is None:
+                    pending = active_runtime_configs.get(key)
+                    if pending:
+                        bridge.apply_runtime_config(pending)
+                        active_runtime_configs.pop(key, None)
+                else:
+                    with lock:
+                        pending = active_runtime_configs.get(key)
+                        if pending:
+                            bridge.apply_runtime_config(pending)
+                            active_runtime_configs.pop(key, None)
+            bridge.handle(item)
+            # ``RuntimeEventNodeBridge`` may switch sessions during a plan
+            # handoff.  Re-key the controller immediately so the new active
+            # leaf remains PATCH-addressable while the same stream continues.
+            for old_key, value in list(active_runtime_bridges.items()):
+                if value is bridge and old_key != registry_key(bridge.thread_id):
+                    active_runtime_bridges.pop(old_key, None)
+                    active_runtime_configs.pop(old_key, None)
+            active_runtime_bridges[registry_key(bridge.thread_id)] = bridge
+            new_stream_key = registry_key(bridge.thread_id)
+            if new_stream_key not in reserved_stream_keys:
+                with stream_lock:
+                    stream_locks["keys"].add(new_stream_key)
+                reserved_stream_keys.add(new_stream_key)
+
+    def publish_frame(frame: NodeFrame) -> None:
+        nonlocal initial_user_activity_recorded
+        bridge = bridge_ref["bridge"]
+        if bridge is None:
+            return
+        alias = frame.turn_id
+        with active_turn_streams_lock:
+            active_turn_streams[alias] = active_stream
+            active_stream_aliases.add(alias)
+            active_turn_cancellations[alias] = pause_controller
+        current = bridge.writer.view(frame.session_id, frame.turn_id)
+        live_bridges = getattr(state, "live_turn_bridges", None)
+        if live_bridges is None:
+            live_bridges = {}
+            state.live_turn_bridges = live_bridges
+        live_bridges[(frame.session_id, frame.turn_id)] = bridge
+        if frame.type == "turn.snapshot" and operation is None and not initial_user_activity_recorded:
+            record_sidebar_activity(current.thread_id)
+            initial_user_activity_recorded = True
+        elif frame.type == "turn.delta" and any(
+            change.get("op") == "append_message" and change.get("message", {}).get("role") == "user"
+            for change in frame.operations
+        ):
+            record_sidebar_activity(current.thread_id)
+        publish_runtime_frame(state, frame, current)
+        if subscribe:
+            active_stream.publish_frame(frame, current)
+
+    def enqueue_terminal(terminal_type: str, terminal_id: str, message: str = "") -> None:
+        nonlocal pending_terminal
+        pending_terminal = (terminal_type, terminal_id, message)
+
+    terminal_report = None
+
+    def publish_terminal(terminal_type: str, terminal_id: str, message: str) -> None:
+        bridge = bridge_ref["bridge"]
+        current = bridge._current() if bridge is not None else None
+        if current is not None and current.status in {"success", "paused", "failed"}:
+            try:
+                for alias in active_stream_aliases:
+                    state.message_queue.release_turn(alias)
+            except MessageQueueUnavailable:
+                logger.warning("Could not release pending messages for finished Turn %s", current.id)
+        active_stream.publish_terminal(terminal_type, terminal_id, message, terminal_report)
+        if current is not None:
+            record_sidebar_activity(current.thread_id)
+        publish_runtime_terminal(
+            state,
+            session_id=current.session_id if current is not None else session_id,
+            thread_id=current.thread_id if current is not None else thread_id,
+            turn_id=terminal_id,
+            terminal_type=terminal_type,
+            message=message,
+            error_report=terminal_report,
+        )
+
+    approval_store = ApprovalStore(_store(state))
+    interrupt = make_interactive_interrupt(
+        sink,
+        cancel_requested=lambda: cancellation_requested() or pause_controller.operation_interrupted(),
+        approval_store=approval_store,
+    )
+
+    effective_reasoning = request_model.reasoning_effort if request_model is not None else reasoning_effort
+
+    def worker() -> None:
+        nonlocal terminal_report
+        app = None
+        conversation = None
+
+        def fail_precreated(exc: Exception, *, category: str, code: str) -> None:
+            if not precreated:
+                return
+            try:
+                store = _store(state)
+                node = store.get_node(session_id, turn_id)
+                if not isinstance(node, RuntimeState) or node.status != "running":
+                    return
+                writer = NodeWriter(store)
+                node = writer.append_item(
+                    node,
+                    terminal_error_payload(
+                        category,
+                        safe_error_message(exc),
+                        retryable=False,
+                        code=code,
+                        error_report=error_report(exc),
+                    ),
+                )
+                writer.finalize(node, "failed")
+            except Exception:
+                logger.exception("Failed to persist the precreated Turn startup error")
+
+        try:
+            outer_job = job_holder["job"]
+            job_parent_id = outer_job.info().id if outer_job is not None else None
+            state.paths.ensure_session(session_id)
+            workspace = state.paths.session_workspace(session_id)
+            bound_project = state.projects.session_project(session_id, include_removed=False)
+            if bound_project is not None and not bound_project.available:
+                raise RuntimeError("项目 cwd 不可访问，请恢复文件夹后重试。")
+            project_cwd = Path(bound_project.cwd).resolve() if bound_project is not None else None
+            selected_model_config = model_config
+            if provider_name:
+                try:
+                    selected_model_config = state.model_config(provider_name)
+                except (SecretDecryptionError, ModelConfigurationError):
+                    raise
+            app = application_builder(
+                state,
+                session_id=session_id,
+                user_preferences=user_preferences,
+                model_config=selected_model_config,
+                load_model_config=False,
+                workspace=workspace,
+                project_id=bound_project.project_id if bound_project is not None else None,
+                project_cwd=project_cwd,
+                job_registry=job_registry,
+                job_parent_id=job_parent_id,
+            )
+            conversation = app.open_conversation(session_id, thread_id=thread_id)
+            # The node id is the optimistic-concurrency boundary for the new
+            # tree protocol.  Legacy conversations do not expose nodes yet,
+            # so validation is delegated to the node store when available.
+            node_store = getattr(app, "session_store", None) or getattr(app, "store", None)
+            if (
+                initial_delivery is not None
+                and initial_delivery.envelope.start is not None
+                and initial_delivery.envelope.start.operation == "rewind"
+            ):
+                node_store.append_turn_version(
+                    turn_id, message.to_item(), delivery_id=initial_delivery.envelope.delivery_id
+                )
+            if callable(getattr(node_store, "create_node", None)):
+                if getattr(conversation, "active_session", None) is None:
+                    conversation.ensure_session(prompt or None)
+                active_session = getattr(conversation, "active_session", None)
+                if active_session is not None:
+                    if callable(getattr(node_store, "append_runtime_delta", None)):
+                        persistence_ref["worker"] = RuntimeFramePersistence(node_store)
+                    bridge_ref["bridge"] = RuntimeEventNodeBridge(
+                        node_store,
+                        session_id=active_session.session_id,
+                        message=message,
+                        turn_id=turn_id,
+                        thread_id=thread_id or active_session.session_id,
+                        source_node_id=source_node_id,
+                        adopt_existing=adopt_existing,
+                        emit_adopted_snapshot=not precreated,
+                        user="",
+                        provider=getattr(selected_model_config, "provider", "unknown")
+                        if selected_model_config
+                        else "unknown",
+                        provider_name=provider_name
+                        or (
+                            getattr(model_config, "provider_name", None) or getattr(model_config, "provider", "unknown")
+                            if model_config
+                            else "unknown"
+                        ),
+                        model=(
+                            str((model_snapshot or {}).get("current_model"))
+                            if isinstance(model_snapshot, dict) and model_snapshot.get("current_model")
+                            else getattr(selected_model_config, "model", "unknown")
+                        )
+                        if selected_model_config
+                        else "unknown",
+                        model_config={
+                            "current_model": getattr(selected_model_config, "model", "unknown")
+                            if selected_model_config
+                            else "unknown",
+                            "context_length": getattr(selected_model_config, "context_size", 128000)
+                            if selected_model_config
+                            else 128000,
+                            "output_length": getattr(selected_model_config, "max_tokens", 8192)
+                            if selected_model_config
+                            else 8192,
+                            "reasoning_effort": reasoning_effort,
+                            "thinking": "enable",
+                            "temperature": getattr(selected_model_config, "temperature", 0.0)
+                            if selected_model_config
+                            else 0.0,
+                            **(model_snapshot or {}),
+                        },
+                        permission_mode=permission_mode or "read_only",
+                        running_mode=mode,
+                        cwd=str(workspace),
+                        project_cwd=str(project_cwd) if project_cwd is not None else "",
+                        delivery_id=initial_delivery.envelope.delivery_id if initial_delivery is not None else None,
+                        emit=publish_frame,
+                        persist_delta=persistence_ref["worker"].submit if persistence_ref["worker"] else None,
+                        flush_persistence=persistence_ref["worker"].flush if persistence_ref["worker"] else None,
+                    )
+                    runtime_for_bridge = getattr(conversation, "runtime", None)
+                    if runtime_for_bridge is not None:
+                        bridge_ref["bridge"].bind_runtime(runtime_for_bridge)
+                        runtime_for_bridge.services.steering = take_steering
+                        runtime_for_bridge.services.register_operation_abort = pause_controller.register_abort
+                        runtime_for_bridge.services.operation_interrupted = pause_controller.operation_interrupted
+                    attach_bridge = getattr(conversation, "attach_runtime_node_bridge", None)
+                    if callable(attach_bridge):
+                        # The SSE sink already forwards every RuntimeEvent to
+                        # this bridge and publishes its NodeFrames.  Mark it
+                        # external so ConversationService reuses it without
+                        # creating a second placeholder/dynamic pair.
+                        attach_bridge(bridge_ref["bridge"], events_external=True)
+                    active_runtime_bridges[registry_key(bridge_ref["bridge"].thread_id)] = bridge_ref["bridge"]
+            if operation is None:
+                request_parameters = _model_request_parameters(request_model, effective_reasoning)
+                run_state = conversation.run_message(
+                    message,
+                    mode=mode,
+                    on_event=sink,
+                    interrupt=interrupt,
+                    cancel_requested=cancellation_requested,
+                    suspend_requested=suspension_requested,
+                    request_parameters=request_parameters,
+                    steering=take_steering,
+                    delivery_id=initial_delivery.envelope.delivery_id if initial_delivery is not None else None,
+                    on_started=(
+                        lambda: state.message_queue.ack(initial_delivery) if initial_delivery is not None else None
+                    ),
+                )
+            else:
+                run_state = operation(
+                    conversation,
+                    interrupt,
+                    sink,
+                    cancellation_requested,
+                    suspension_requested,
+                    _model_request_parameters(request_model, effective_reasoning),
+                    take_steering,
+                )
+            active_session = getattr(conversation, "active_session", None)
+            bridge = bridge_ref["bridge"]
+            if bridge is not None:
+                old_status = str(run_state.status if run_state is not None else "abort")
+                stop_reason = str(getattr(run_state, "stop_reason", "") or "")
+                if pause_controller.is_requested():
+                    requested_status = "paused"
+                    category = "user"
+                elif old_status in {"completed", "success"}:
+                    requested_status = "success"
+                    category = None
+                elif old_status == "cancelled":
+                    requested_status = "paused"
+                    category = "user"
+                elif bridge.abort_category is not None:
+                    requested_status = "failed"
+                    category = bridge.abort_category
+                else:
+                    requested_status = "failed"
+                    category = bridge.abort_category or "agent"
+                final_answer = (run_state.final_answer if run_state is not None else "") or ""
+                final_node = bridge.finish(
+                    requested_status,
+                    final_answer,
+                    category=category,
+                    code=bridge.abort_code or stop_reason,
+                )
+                terminal_status = final_node.status if final_node is not None else "failed"
+                terminal_id = final_node.id if final_node is not None else turn_id or bridge.turn_id or "unknown"
+                if conversation is not None and final_node is not None:
+                    _auto_title_main_thread(
+                        conversation,
+                        node_store,
+                        session_id=final_node.session_id,
+                        thread_id=final_node.thread_id,
+                        turn_id=final_node.id,
+                    )
+                terminal_type = _terminal_type_for_status(terminal_status, category)
+                terminal_message = _terminal_message_for_turn(
+                    terminal_type,
+                    bridge.terminal_error,
+                    turn_id=terminal_id,
+                    status=terminal_status,
+                    category=category,
+                    code=bridge.abort_code or stop_reason,
+                )
+                enqueue_terminal(terminal_type, terminal_id, terminal_message)
+            else:
+                enqueue_terminal("failed", turn_id or "unknown", "Turn persistence is unavailable.")
+        except MessageQueueUnavailable as exc:
+            terminal_report = error_report(exc)
+            bridge = bridge_ref["bridge"]
+            error_message = safe_error_message(exc)
+            if bridge is not None:
+                final_node = bridge.finish(
+                    "failed",
+                    error_message,
+                    category="server",
+                    code="message_queue_unavailable",
+                    error_report=error_report(exc),
+                )
+                terminal_id = final_node.id if final_node is not None else turn_id or "unknown"
+                enqueue_terminal("failed", terminal_id, error_message)
+            else:
+                fail_precreated(exc, category="server", code="message_queue_unavailable")
+                enqueue_terminal("failed", turn_id or "unknown", error_message)
+        except (SecretDecryptionError, ModelConfigurationError) as exc:
+            terminal_report = error_report(exc)
+            if bridge_ref["bridge"] is not None:
+                error_message = safe_error_message(exc)
+                bridge_ref["bridge"].finish(
+                    "failed",
+                    error_message,
+                    category="agent",
+                    code="model_configuration_error",
+                    error_report=error_report(exc),
+                )
+                rendered_error = terminal_error_text(bridge_ref["bridge"].terminal_error or {})
+                enqueue_terminal("failed", turn_id or bridge_ref["bridge"].turn_id or "unknown", rendered_error)
+            else:
+                fail_precreated(exc, category="agent", code="model_configuration_error")
+                enqueue_terminal("failed", turn_id or "unknown", safe_error_message(exc))
+        except Exception as exc:
+            terminal_report = error_report(exc)
+            bridge = bridge_ref["bridge"]
+            if bridge is not None:
+                if pause_controller.is_requested():
+                    final_node = bridge.finish("paused", "", category="user", code="user_paused")
+                    rendered_error = ""
+                else:
+                    final_node = bridge.finish_exception(exc)
+                    rendered_error = terminal_error_text(bridge.terminal_error or {}) if bridge.terminal_error else ""
+                terminal_id = final_node.id if final_node is not None else turn_id or bridge.turn_id or "unknown"
+                if pause_controller.is_requested() and final_node is not None and not bridge.persistence_failed:
+                    enqueue_terminal("success", terminal_id)
+                else:
+                    enqueue_terminal(
+                        "failed",
+                        terminal_id,
+                        terminal_error_text(bridge.terminal_error or {}) or rendered_error or safe_error_message(exc),
+                    )
+            else:
+                fail_precreated(exc, category="server", code=type(exc).__name__)
+                enqueue_terminal("failed", turn_id or "unknown", _startup_failure_message(exc))
+        finally:
+            persistence = persistence_ref["worker"]
+            if persistence is not None:
+                try:
+                    persistence.close()
+                except Exception:
+                    logger.error("Runtime persistence worker stopped after a write failure.")
+            bridge = bridge_ref["bridge"]
+            if bridge is not None:
+                live_bridges = getattr(state, "live_turn_bridges", {})
+                for key, live in list(live_bridges.items()):
+                    if live is bridge:
+                        live_bridges.pop(key, None)
+                # A plan handoff can switch the bridge to a new session while
+                # the old key remains in the process-local registry.  Remove
+                # every alias that points to this bridge, otherwise a later
+                # PATCH could mutate a completed run.
+                for key, value in list(active_runtime_bridges.items()):
+                    if value is bridge:
+                        active_runtime_bridges.pop(key, None)
+                        active_runtime_configs.pop(key, None)
+            if app is not None:
+                try:
+                    app.close()
+                except Exception:
+                    pass
+            coordinator = getattr(state, "subagent_coordinator", None)
+            if coordinator is not None:
+                try:
+                    coordinator.receive_pending_reports(session_id, thread_id)
+                except Exception as exc:
+                    terminal_report = error_report(exc)
+                    enqueue_terminal("failed", turn_id or "unknown", safe_error_message(exc))
+            steering_inbox.close()
+            # Publish completion only after teardown. Hold admission until the
+            # terminal is delivered so a rewind cannot replace this Turn's
+            # persisted version while its previous terminal is being emitted.
+            with stream_lock:
+                stream_locks["keys"].difference_update(reserved_stream_keys)
+                with active_turn_streams_lock:
+                    try:
+                        if pending_terminal is not None:
+                            publish_terminal(*pending_terminal)
+                    finally:
+                        for alias in active_stream_aliases:
+                            if active_turn_streams.get(alias) is active_stream:
+                                active_turn_streams.pop(alias, None)
+                            if active_turn_cancellations.get(alias) is pause_controller:
+                                active_turn_cancellations.pop(alias, None)
+                        if cache is not None:
+                            cache.finish(thread_id, turn_id)
+
+    if job_registry is not None:
+        parent_scope = getattr(state, "system_job_scope", job_registry.root_scope())
+        session_scope = parent_scope.child(
+            JobScopeKind.SESSION,
+            session_id=session_id,
+        )
+        thread_scope = session_scope.child(JobScopeKind.THREAD, thread_id=thread_id)
+        job = ThreadJob(job_registry.new_job_id(), worker)
+        job_holder["job"] = job
+        job_registry.submit(job, scope=thread_scope, lane=JobLane.FOREGROUND, admission=AdmissionPolicy())
+    else:
+        # Focused embedding tests may use a minimal state double.  Preserve a
+        # self-contained fallback while production always supplies a registry.
+        threading.Thread(target=worker, daemon=True).start()
+
+    return original_subscription.as_sse() if original_subscription is not None else None

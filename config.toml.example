@@ -1,0 +1,37 @@
+# Copy this file to ~/.praxis/config.toml.
+# Provider metadata and encrypted API keys live in runtime/state.db, not TOML.
+[profile]
+display_name = "本地用户"
+agent_preferences = ""
+
+[agent]
+tone = "balanced"
+verbosity = "balanced"
+initiative = "balanced"
+custom_instructions = ""
+display_mode = "medium"
+timezone = "Asia/Shanghai"
+location_enabled = false
+
+[runtime]
+# true stores complete recursively redacted bodies; false stores summaries.
+log_full_messages = true
+# Maximum number of model-requested tool calls in one Agent workflow.
+# Successful, failed, and repeated calls all consume one slot.
+max_tool_calls = 32
+
+[mcp]
+initialization_timeout_seconds = 15
+call_timeout_seconds = 60
+shutdown_timeout_seconds = 5
+
+[skills]
+# Explicit $skill-name references always activate directly. Enable this only
+# when an extra model preflight for tasks without an explicit reference is desired.
+auto_select = false
+
+[subagents]
+max_tasks_per_batch = 8
+max_workers = 4
+task_timeout_seconds = 300
+batch_timeout_seconds = 600

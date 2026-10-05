@@ -1,0 +1,354 @@
+import { Button, Drawer, Grid, Layout, Splitter } from "antd";
+import { MenuOutlined } from "@ant-design/icons";
+import { useEffect, useRef, useState } from "react";
+import type { LocalProfile, RightPanelWindow, RuntimeStateNode } from "../types";
+import type { AgentConfig, ProviderConfig, SidebarThreadSort } from "../api";
+import type { ChatRunRequest } from "./types";
+import type { ChatMode, Conversation, DisplayMode, Page } from "../types";
+import type { ProjectInfo } from "../api";
+import type { QueuedMessage } from "./types";
+import AppSidebar from "../components/AppSidebar";
+import BenchmarkPage from "../pages/BenchmarkPage";
+import ChatPage from "../pages/ChatPage";
+import TrashPage from "../pages/TrashPage";
+import UserSettingsModal from "../components/UserSettingsModal";
+import IconAction from "../components/IconAction";
+import type { SandboxHealthState } from "./useSandboxHealth";
+import RightPanel, { RightPanelLauncher, useRightPanel } from "../components/rightPanel/RightPanel";
+import { allowAllFilePanelsToLeave } from "../components/rightPanel/filePanelLifecycle";
+import { flushViews } from "./viewState";
+
+export const DEFAULT_RIGHT_PANEL_WIDTH = 420;
+export const RIGHT_PANEL_CLOSE_THRESHOLD = 280;
+
+export function rightPanelPreviewWidth(width: number) {
+  return Math.max(width, RIGHT_PANEL_CLOSE_THRESHOLD);
+}
+
+export function rightPanelResizeOutcome(width: number, savedWidth: number) {
+  return width < RIGHT_PANEL_CLOSE_THRESHOLD
+    ? { previewWidth: savedWidth || DEFAULT_RIGHT_PANEL_WIDTH, patch: { collapsed: true } as const }
+    : { previewWidth: width, patch: { width, collapsed: false } as const };
+}
+
+export interface AgentShellProps {
+  routeUnavailable?: boolean;
+  synchronized?: boolean;
+  profile: LocalProfile;
+  page: Page;
+  current: Conversation | null;
+  panelConversations: Record<string, Conversation>;
+  activeConversations: Conversation[];
+  projects: ProjectInfo[];
+  projectsLoaded?: boolean;
+  removedProjects: ProjectInfo[];
+  projectLoading?: boolean;
+  archivedConversations: Conversation[];
+  unreadArchivedCount: number;
+  modeBySession: Record<string, ChatMode>;
+  draftMode: ChatMode;
+  displayMode: DisplayMode;
+  providerConfig: ProviderConfig | null;
+  settingsOpen: boolean;
+  setSettingsOpen: (open: boolean) => void;
+  onProfileChange: (profile: LocalProfile) => void;
+  onNew: (title?: string) => Promise<string>;
+  onNewProject: () => Promise<void>;
+  onNewProjectConversation: (projectId: string) => Promise<void>;
+  onRemoveProject: (projectId: string) => Promise<void>;
+  onRenameProject: (projectId: string, name: string) => Promise<void>;
+  onChangeProjectPath: (projectId: string) => Promise<void>;
+  onRevokeSkillTrust: (projectId: string) => Promise<void>;
+  onRestoreProject: (projectId: string) => Promise<void>;
+  onSelect: (id: string) => void;
+  onNavigate: (page: Page) => void;
+  onRename: (id: string, title: string) => Promise<void>;
+  onArchive: (id: string) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
+  onReorderSidebar: (projectId: string | null, orderedThreadIds: string[]) => Promise<void>;
+  onSortSidebar: (projectId: string | null, sortBy: SidebarThreadSort) => Promise<void>;
+  onRestore: (id: string) => Promise<void>;
+  onProfileUpdate: (profile: { display_name: string; agent_preferences: string }) => Promise<void>;
+  onUpdate: (id: string, updater: (conversation: Conversation) => Conversation) => void;
+  onModeChange: (mode: ChatMode) => void;
+  onPanelModeChange: (id: string, mode: ChatMode) => void;
+  onHydratePanelConversation: (window: RightPanelWindow) => Promise<void>;
+  onForgetPanelConversation: (windowId: string) => void;
+  onEnsureSession: (id: string) => Promise<string>;
+  onFork: (conversationId: string, messageId: string) => Promise<void>;
+  onRewind: (conversationId: string, messageId: string) => Promise<{ content: string; sessionId: string; sourceNodeId?: string; rewindTurnId?: string } | undefined>;
+  onRewindPanel: (conversationId: string, messageId: string) => Promise<{ content: string; sessionId: string; sourceNodeId?: string; rewindTurnId?: string } | undefined>;
+  onSelectSession: (sessionId: string) => Promise<string>;
+  onReload: (id: string) => Promise<void>;
+  onReloadPanel: (id: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onRun: (request: ChatRunRequest) => Promise<void>;
+  onStopRun: (turn: RuntimeStateNode) => void;
+  queuedMessages?: Map<string, QueuedMessage[]>;
+  onQueuedMessagesChange?: (conversationId: string, updater: (items: QueuedMessage[]) => QueuedMessage[]) => void;
+  onQueuedMessagesRefresh?: (conversationId: string) => Promise<void>;
+  onDisplayModeUpdate: (config: AgentConfig) => void;
+  onProviderConfigUpdate: (config: ProviderConfig) => void;
+  sandboxHealth: SandboxHealthState;
+}
+
+export default function AgentShell(props: AgentShellProps) {
+  const screens = Grid.useBreakpoint();
+  const isMobile = screens.md === false;
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [visited, setVisited] = useState(() => new Set<Page>([props.page]));
+  const [chatWasHidden, setChatWasHidden] = useState(false);
+  useEffect(() => {
+    setVisited((current) => current.has(props.page) ? current : new Set([...current, props.page]));
+    if (props.page !== "chat" && visited.has("chat")) setChatWasHidden(true);
+  }, [props.page, visited]);
+  const [previewPanelWidth, setPreviewPanelWidth] = useState<number | string>("50%");
+  const rawPanelWidthRef = useRef(DEFAULT_RIGHT_PANEL_WIDTH);
+  const panel = useRightPanel(
+    props.current?.sessionId,
+    props.current?.activeTurnId ?? props.current?.lastNodeId,
+    props.onHydratePanelConversation,
+    props.onForgetPanelConversation,
+    props.current?.threadId ?? props.current?.id,
+  );
+  useEffect(() => {
+    if (isMobile) setSidebarCollapsed(false);
+    else setMobileSidebarOpen(false);
+  }, [isMobile]);
+  useEffect(() => {
+    rawPanelWidthRef.current = 0;
+    setPreviewPanelWidth("50%");
+  }, [props.current?.id, panel.payload?.state.collapsed]);
+  const userBackendRequest = <T,>(request: () => T): T => {
+    props.sandboxHealth.notifyUserBackendRequest();
+    return request();
+  };
+  const closeMobile = () => setMobileSidebarOpen(false);
+  const navigate = (page: Page) => {
+    void flushViews();
+    props.onNavigate(page);
+    closeMobile();
+  };
+  const select = async (id: string) => {
+    props.sandboxHealth.notifyUserBackendRequest();
+    if (!await allowAllFilePanelsToLeave()) return;
+    void flushViews();
+    props.onSelect(id);
+    closeMobile();
+  };
+  const create = async (title?: string) => {
+    props.sandboxHealth.notifyUserBackendRequest();
+    if (!await allowAllFilePanelsToLeave()) return props.current?.id ?? "";
+    const id = await props.onNew(title);
+    closeMobile();
+    return id;
+  };
+  const createProject = async () => {
+    await userBackendRequest(() => props.onNewProject());
+    closeMobile();
+  };
+  const createProjectConversation = async (projectId: string) => {
+    props.sandboxHealth.notifyUserBackendRequest();
+    if (!await allowAllFilePanelsToLeave()) return;
+    await props.onNewProjectConversation(projectId);
+    closeMobile();
+  };
+  const useSession = async (sessionId: string) => {
+    props.sandboxHealth.notifyUserBackendRequest();
+    if (!await allowAllFilePanelsToLeave()) return props.current?.id ?? sessionId;
+    const id = await props.onSelectSession(sessionId);
+    closeMobile();
+    return id;
+  };
+  const sidebar = (
+    <AppSidebar
+      profile={props.profile}
+      conversations={props.activeConversations}
+      projects={props.projects}
+      projectsLoaded={props.projectsLoaded}
+      projectLoading={props.projectLoading}
+      archivedCount={props.unreadArchivedCount}
+      currentId={props.current?.id ?? null}
+      page={props.page}
+      onNew={create}
+      onNewProject={createProject}
+      onNewProjectConversation={createProjectConversation}
+      onRemoveProject={(projectId) => userBackendRequest(() => props.onRemoveProject(projectId))}
+      onRenameProject={(projectId, name) => userBackendRequest(() => props.onRenameProject(projectId, name))}
+      onChangeProjectPath={(projectId) => userBackendRequest(() => props.onChangeProjectPath(projectId))}
+      onRevokeSkillTrust={(projectId) => userBackendRequest(() => props.onRevokeSkillTrust(projectId))}
+      onSelect={select}
+      onNavigate={navigate}
+      onRename={(id, title) => userBackendRequest(() => props.onRename(id, title))}
+      onArchive={(id) => userBackendRequest(() => props.onArchive(id))}
+      onDelete={(id) => userBackendRequest(() => props.onDelete(id))}
+      onReorder={(projectId, orderedThreadIds) => userBackendRequest(() => props.onReorderSidebar(projectId, orderedThreadIds))}
+      onSort={(projectId, sortBy) => userBackendRequest(() => props.onSortSidebar(projectId, sortBy))}
+      onProfileUpdate={(profile) => userBackendRequest(() => props.onProfileUpdate(profile))}
+      onOpenSettings={() => {
+        closeMobile();
+        userBackendRequest(() => props.setSettingsOpen(true));
+      }}
+      collapsed={sidebarCollapsed}
+      onToggleCollapse={() => {
+        if (isMobile) closeMobile();
+        else setSidebarCollapsed((current) => !current);
+      }}
+    />
+  );
+  const sourceTurnId = props.current?.activeTurnId ?? props.current?.lastNodeId;
+  const sourceTurn = props.current?.runtimeNodes?.find((node) => node.id === sourceTurnId);
+  const sourceAvailable = Boolean(props.current?.sessionId && sourceTurnId);
+  const terminalReason = !sourceAvailable
+    ? "当前没有可用 Turn"
+    : !sourceTurn || !("cwd" in sourceTurn) || !sourceTurn.cwd
+      ? "当前 Turn 没有可用 cwd"
+      : panel.payload?.capabilities.terminal_unavailable_reason ?? "配置的终端当前不可用";
+  const terminalAvailable = sourceAvailable
+    && Boolean(sourceTurn && "cwd" in sourceTurn && sourceTurn.cwd)
+    && panel.payload?.capabilities.terminal_available === true;
+  const mainContent = (
+        props.routeUnavailable ? <div role="status" style={{ padding: 24 }}>
+          <p>对话不存在、已归档或已删除。</p>
+          <button onClick={() => navigate("trash")}>前往回收站</button>
+        </div> :
+        <ChatPage
+          active={props.page === "chat"}
+          conversation={props.current}
+          agentThreadNavigation
+          retainedConversationIds={props.activeConversations.filter((item) => item.messagesLoaded).map((item) => item.id)}
+          mode={props.current ? props.modeBySession[props.current.threadId ?? props.current.sessionId ?? props.current.id] ?? "agent" : props.draftMode}
+          displayMode={props.displayMode}
+          providerConfig={props.providerConfig}
+          onModeChange={props.onModeChange}
+          onUpdate={props.onUpdate}
+          onNew={create}
+          onNavigate={navigate}
+          onEnsureSession={(id) => userBackendRequest(() => props.onEnsureSession(id))}
+          onFork={(conversationId, messageId) => userBackendRequest(() => props.onFork(conversationId, messageId))}
+          onRewind={(conversationId, messageId) => userBackendRequest(() => props.onRewind(conversationId, messageId))}
+          onSelectSession={useSession}
+          onReload={(id) => userBackendRequest(() => props.onReload(id))}
+          onRefresh={() => userBackendRequest(() => props.onRefresh())}
+          onRun={(request) => userBackendRequest(() => props.onRun(request))}
+          onStopRun={(id) => userBackendRequest(() => props.onStopRun(id))}
+          queuedMessages={props.queuedMessages?.get(props.current?.id ?? "") ?? []}
+          onQueuedMessagesChange={props.onQueuedMessagesChange}
+          onQueuedMessagesRefresh={props.onQueuedMessagesRefresh}
+          sandboxHealth={props.sandboxHealth}
+        />
+  );
+  const renderSideChat = (window: RightPanelWindow) => {
+    const conversation = props.panelConversations[window.id] ?? null;
+    return (
+      <div className="right-panel-side-chat">
+        <ChatPage
+          active={props.page === "chat" && panel.payload?.state.collapsed === false && panel.payload?.state.active_window_id === window.id}
+          showButtonTooltips={false}
+          conversation={conversation}
+          mode={conversation ? props.modeBySession[conversation.threadId ?? conversation.id] ?? "agent" : "agent"}
+          displayMode={props.displayMode}
+          providerConfig={props.providerConfig}
+          onModeChange={(mode) => props.onPanelModeChange(window.id, mode)}
+          onUpdate={props.onUpdate}
+          onNew={create}
+          onNavigate={navigate}
+          onEnsureSession={async () => window.session_id}
+          onRewind={(conversationId, messageId) => userBackendRequest(() => props.onRewindPanel(conversationId, messageId))}
+          onSelectSession={useSession}
+          onReload={(id) => userBackendRequest(() => props.onReloadPanel(id))}
+          onRefresh={() => userBackendRequest(() => props.onHydratePanelConversation(window))}
+          onRun={(request) => userBackendRequest(() => props.onRun(request))}
+          onStopRun={(id) => userBackendRequest(() => props.onStopRun(id))}
+          queuedMessages={props.queuedMessages?.get(window.id) ?? []}
+          onQueuedMessagesChange={props.onQueuedMessagesChange}
+          onQueuedMessagesRefresh={props.onQueuedMessagesRefresh}
+          sandboxHealth={props.sandboxHealth}
+        />
+      </div>
+    );
+  };
+  const panelOpen = Boolean(props.current?.sessionId) && panel.payload?.state.collapsed === false;
+  const rightPanel = <RightPanel active={props.page === "chat" && panelOpen} controller={panel} sourceAvailable={sourceAvailable} terminalAvailable={terminalAvailable} terminalReason={terminalReason} renderSideChat={renderSideChat} />;
+  return (
+    <Layout className={`app-shell${sidebarCollapsed && !isMobile ? " app-shell--sidebar-collapsed" : ""}`} style={{ minHeight: "100vh", height: "100vh" }}>
+      {!isMobile && <Layout.Sider id="chat-sidebar" width={280} collapsed={sidebarCollapsed} collapsedWidth={0} trigger={null} style={{ background: "var(--sidebar-bg)", borderRight: "1px solid var(--border)", zIndex: 1 }}>{sidebar}</Layout.Sider>}
+      {isMobile && <Drawer title="会话列表" placement="left" size={280} open={mobileSidebarOpen} onClose={closeMobile} styles={{ body: { padding: 0 } }}>{sidebar}</Drawer>}
+      <Layout style={{ minWidth: 0, minHeight: 0 }}>
+        {sidebarCollapsed && !isMobile ? <Button className="sidebar-reopen-button" type="default" size="small" onClick={() => setSidebarCollapsed(false)} aria-label="展开侧边栏" aria-expanded={false} aria-controls="chat-sidebar" icon={<MenuOutlined />} /> : null}
+        {isMobile && <div className="mobile-sidebar-bar"><Button type="text" icon={<MenuOutlined />} onClick={() => setMobileSidebarOpen(true)} aria-label="打开会话列表">会话列表</Button></div>}
+        <Layout.Content className="main" style={{ minHeight: 0 }}>
+          {props.synchronized === false ? <div role="status" className="sync-status">正在同步后端状态</div> : null}
+          <div className={`retained-page retained-page--chat${chatWasHidden ? " retained-page--returned" : ""}`} hidden={props.page !== "chat"}>
+          {visited.has("chat") || props.page === "chat" ? <>
+          {!isMobile ? (
+            <Splitter
+              style={{ width: "100%", height: "100%" }}
+              onResize={(sizes) => {
+                const width = Number(sizes[1]) || 0;
+                rawPanelWidthRef.current = width;
+                setPreviewPanelWidth(rightPanelPreviewWidth(width));
+              }}
+              onResizeEnd={(sizes) => {
+                const reportedWidth = Number(sizes[1]) || 0;
+                const width = rawPanelWidthRef.current || reportedWidth;
+                const outcome = rightPanelResizeOutcome(width, panel.payload?.state.width ?? DEFAULT_RIGHT_PANEL_WIDTH);
+                panel.setLayout(outcome.patch);
+                rawPanelWidthRef.current = outcome.previewWidth;
+                setPreviewPanelWidth(outcome.previewWidth);
+              }}
+            >
+              <Splitter.Panel min={0}>{mainContent}</Splitter.Panel>
+              <Splitter.Panel size={panelOpen ? previewPanelWidth : 0} resizable={panelOpen} min={0} max="100%" destroyOnHidden={false}>
+                <div className="right-panel-shell" hidden={!panelOpen}>{rightPanel}</div>
+              </Splitter.Panel>
+            </Splitter>
+          ) : mainContent}
+          {!isMobile && props.page === "chat" && props.current?.sessionId && !panelOpen ? <RightPanelLauncher controller={panel} /> : null}
+          {isMobile && props.page === "chat" && props.current?.sessionId && !panelOpen ? <RightPanelLauncher controller={panel} /> : null}
+          {isMobile && props.current?.sessionId ? (
+            <Drawer
+              title="右侧边栏"
+              placement="right"
+              size="100%"
+              open={props.page === "chat" && panelOpen}
+              onClose={() => {
+                void allowAllFilePanelsToLeave().then((allowed) => {
+                  if (allowed) panel.setLayout({ collapsed: true });
+                });
+              }}
+              styles={{ body: { padding: 0, overflow: "hidden" } }}
+            >
+              <div className="right-panel-shell">{rightPanel}</div>
+            </Drawer>
+          ) : null}
+          </> : null}
+          </div>
+          <div className="retained-page" hidden={props.page !== "trash"}>
+            {visited.has("trash") || props.page === "trash" ? <TrashPage
+              conversations={props.archivedConversations}
+              projects={props.removedProjects}
+              onRestore={(id) => userBackendRequest(() => props.onRestore(id))}
+              onDelete={(id) => userBackendRequest(() => props.onDelete(id))}
+              onRestoreProject={(id) => userBackendRequest(() => props.onRestoreProject(id))}
+            /> : null}
+          </div>
+          <div className="retained-page" hidden={props.page !== "benchmark"}>
+            {visited.has("benchmark") || props.page === "benchmark" ? <BenchmarkPage active={props.page === "benchmark"} /> : null}
+          </div>
+        </Layout.Content>
+      </Layout>
+      <UserSettingsModal
+        open={props.settingsOpen}
+        profile={props.profile}
+        onClose={() => props.setSettingsOpen(false)}
+        onProfileChange={props.onProfileChange}
+        activeSessionId={props.current?.sessionId}
+        onAgentConfigUpdate={props.onDisplayModeUpdate}
+        onProviderConfigUpdate={props.onProviderConfigUpdate}
+        sandboxHealth={props.sandboxHealth}
+      />
+    </Layout>
+  );
+}

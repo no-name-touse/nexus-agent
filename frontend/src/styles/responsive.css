@@ -1,0 +1,171 @@
+@media (max-width: 767px) {
+  .chat-scroll {
+    padding-top: 20px;
+  }
+
+  .composer {
+    padding: 0 var(--chat-gutter) 16px;
+  }
+
+  .composer.has-todo {
+    padding-top: 46px;
+  }
+
+  .message-content {
+    max-width: 88%;
+  }
+
+  .trash-page,
+  .benchmark-page {
+    padding: 20px 14px;
+  }
+
+
+.sidebar-utility-links {
+    grid-template-columns: 1fr;
+  }
+
+  .form-links {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+.user-settings-modal {
+  width: min(900px, calc(100vw - 24px)) !important;
+  max-width: calc(100vw - 24px);
+  height: min(680px, calc(100vh - 24px));
+  max-height: calc(100vh - 24px);
+}
+
+.user-settings-modal .ant-modal-content {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-height: none;
+  min-height: 0;
+}
+
+.user-settings-modal .ant-modal-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.user-settings-modal .ant-modal-body {
+  flex: 1 1 auto;
+}
+
+.user-settings-layout {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+  margin: -8px -4px 0;
+}
+
+.user-settings-modal .ant-modal-body {
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.user-settings-nav {
+  border-right: 1px solid var(--border);
+  padding: 12px 8px 12px 0;
+}
+
+.user-settings-nav .ant-menu {
+  border-inline-end: 0;
+  background: transparent;
+}
+
+.user-settings-detail {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 24px 12px 28px;
+}
+
+.user-settings-detail .ant-form-item {
+  margin-bottom: 18px;
+}
+
+.user-settings-loading {
+  flex: 1 1 auto;
+  display: grid;
+  min-height: 0;
+  width: 100%;
+  place-items: center;
+}
+
+.user-settings-detail .ant-space-compact {
+  align-items: flex-start;
+}
+
+.provider-management .ant-collapse {
+  width: 100%;
+}
+
+.provider-management .ant-collapse-content-box {
+  overflow-x: auto;
+}
+
+@media (max-width: 640px) {
+  .user-settings-modal {
+    height: min(680px, calc(100vh - 16px));
+    max-height: calc(100vh - 16px);
+  }
+
+  .user-settings-modal .ant-modal-content {
+    min-height: 0;
+  }
+
+  .user-settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 0;
+  }
+
+  .user-settings-nav {
+    min-width: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 0 0 8px;
+  }
+
+  .user-settings-nav .ant-menu {
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .user-settings-nav .ant-menu-item {
+    flex: 0 0 auto;
+    width: auto;
+  }
+
+  .user-settings-detail {
+    padding: 18px 4px 4px;
+  }
+
+  .user-settings-detail .ant-space-compact {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .user-settings-detail .ant-space-compact > .ant-form-item {
+    width: 100%;
+    margin-inline-end: 0;
+  }
+
+  .provider-management .ant-space {
+    flex-wrap: wrap;
+  }
+
+}

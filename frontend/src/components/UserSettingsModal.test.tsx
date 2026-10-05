@@ -1,0 +1,582 @@
+import { App as AntApp } from "antd";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as sandboxApi from "../api/settings";
+import UserSettingsModal from "./UserSettingsModal";
+
+const api = vi.hoisted(() => ({
+  getSettings: vi.fn(),
+  updateProfile: vi.fn(),
+  updateAgentConfig: vi.fn(),
+  updateRuntimeConfig: vi.fn(),
+  updateSandboxConfig: vi.fn(),
+  updateProviderConfig: vi.fn(),
+  addProviderConfig: vi.fn(),
+  updateProviderConfigById: vi.fn(),
+  activateProviderConfig: vi.fn(),
+  deleteProviderConfig: vi.fn(),
+  discoverProviderModels: vi.fn(),
+  setTimezone: vi.fn(),
+  getSkillSettings: vi.fn(),
+  setSkillsEnabled: vi.fn(),
+  setSkillEnabled: vi.fn(),
+  importSkill: vi.fn(),
+  deleteSkill: vi.fn(),
+  getMcpSettings: vi.fn(),
+  setMcpEnabled: vi.fn(),
+  saveMcpSettings: vi.fn(),
+  testMcpServer: vi.fn(),
+}));
+
+vi.mock("../api", () => api);
+
+const settings = {
+  profile: { display_name: "旧名字", agent_preferences: "" },
+  agent_config: { tone: "balanced", verbosity: "balanced", initiative: "balanced", custom_instructions: "" },
+  runtime_config: { max_tool_calls: 32, terminal_type: "cmd" as const },
+  sandbox_config: {
+    network_mode: "no_network" as const,
+    network_allowlist: [],
+    proxy_port: 17831,
+    limits: {
+      wall_seconds: 300,
+      cpu_seconds: 300,
+      memory_mib: 4096,
+      processes: 256,
+      handles: 16384,
+      output_chars: 20000,
+      write_io_mib: 0,
+    },
+  },
+  terminal_options: [
+    { value: "cmd" as const, label: "命令提示符（cmd）" },
+    { value: "powershell" as const, label: "Windows PowerShell" },
+  ],
+  terminal_notice: null,
+  provider_config: {
+    id: "provider-1",
+    is_active: true,
+    provider: "openai",
+    protocol: "chat_completions" as const,
+    base_url: "https://example.test/v1",
+    model: "demo",
+    max_tokens: 8192,
+    context_size: 1024000,
+    temperature: 0,
+    tokenizer_model: "demo",
+    api_key_configured: false,
+  },
+  provider_configs: [{
+    id: "provider-1",
+    is_active: true,
+    provider: "openai",
+    protocol: "chat_completions" as const,
+    base_url: "https://example.test/v1",
+    model: "demo",
+    max_tokens: 8192,
+    context_size: 1024000,
+    temperature: 0,
+    tokenizer_model: "demo",
+    api_key_configured: false,
+  }],
+  capability_config: {},
+  timezone_options: [],
+};
+
+const localProfile = { display_name: "旧名字", agent_preferences: "" };
+const sandboxHealth = {
+  phase: "healthy" as const,
+  installed: true,
+  code: null,
+  detail: null,
+  checking: false,
+  autoRecoveryPhase: "idle" as const,
+  nextRetryAt: null,
+  check: vi.fn().mockResolvedValue({ installed: true, healthy: true }),
+  notifyUserBackendRequest: vi.fn(),
+};
+
+function modalElement(
+  open: boolean,
+  onClose = vi.fn(),
+  onProfileChange = vi.fn(),
+  onProviderConfigUpdate = vi.fn(),
+) {
+  return (
+    <AntApp>
+      <UserSettingsModal
+        open={open}
+        profile={localProfile}
+        activeSessionId="session-current"
+        onClose={onClose}
+        onProfileChange={onProfileChange}
+        onProviderConfigUpdate={onProviderConfigUpdate}
+        sandboxHealth={sandboxHealth}
+      />
+    </AntApp>
+  );
+}
+
+function renderModal(onClose = vi.fn(), onProfileChange = vi.fn(), onProviderConfigUpdate = vi.fn()) {
+  return render(modalElement(true, onClose, onProfileChange, onProviderConfigUpdate));
+}
+
+describe("UserSettingsModal", () => {
+  afterEach(() => cleanup());
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(sandboxApi, "getSandboxResources").mockResolvedValue({
+      usage: { memory_bytes: 0, processes: 0, handles: 0 },
+      limits: { memory_mib: 8192, processes: 512, handles: 32768 }, queued: 0,
+    });
+    api.getSettings.mockResolvedValue(structuredClone(settings));
+    api.updateProfile.mockResolvedValue({ display_name: "新名字", agent_preferences: "" });
+    api.updateAgentConfig.mockResolvedValue(settings.agent_config);
+    api.updateRuntimeConfig.mockResolvedValue(settings.runtime_config);
+    api.updateSandboxConfig.mockResolvedValue(settings.sandbox_config);
+    api.updateProviderConfig.mockResolvedValue(settings.provider_config);
+    api.discoverProviderModels.mockResolvedValue({ models: [] });
+    api.getSkillSettings.mockResolvedValue({ enabled: true, skills: [] });
+    api.getMcpSettings.mockResolvedValue({ enabled: false, mcpServers: {} });
+  });
+
+  it("renders the settings spinner inside the full content-area loading container", () => {
+    api.getSettings.mockReturnValue(new Promise(() => undefined));
+    renderModal();
+
+    const loading = document.querySelector(".user-settings-modal .ant-modal-body > .user-settings-loading");
+    expect(loading).toBeInTheDocument();
+    expect(loading?.querySelector(".ant-spin")).toBeInTheDocument();
+  });
+
+  it("switches among profile, agent, and provider sections", async () => {
+    renderModal();
+    expect(await screen.findByDisplayValue("旧名字")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "用户名" })).toHaveValue("旧名字");
+
+    await userEvent.click(screen.getByRole("menuitem", { name: "Agent 配置" }));
+    expect(screen.getByRole("textbox", { name: "自由文本偏好" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("menuitem", { name: "运行配置" }));
+    expect(screen.getByRole("spinbutton", { name: "工具调用上限" })).toHaveValue("32");
+
+    await userEvent.click(screen.getByRole("menuitem", { name: "添加提供商" }));
+    expect(screen.getByText("Base URL")).toBeInTheDocument();
+    expect(screen.getByText("Chat Completions")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    expect(screen.getByText(/openai/)).toBeInTheDocument();
+
+    expect(screen.getByRole("menuitem", { name: "Skill" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "MCP" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "云同步" })).not.toBeInTheDocument();
+  });
+
+  it("preserves the saved DeepSeek provider name", async () => {
+    const legacyProvider = {
+      ...settings.provider_config,
+      provider: "deepseek",
+      provider_name: "deepseek",
+    };
+    api.getSettings.mockResolvedValue({
+      ...settings,
+      provider_config: legacyProvider,
+      provider_configs: [legacyProvider],
+    });
+
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+
+    expect(screen.getByText(/deepseek · demo/)).toBeInTheDocument();
+  });
+
+  it("adds a Provider with token limits and an Ant Design Temperature slider", async () => {
+    const created = {
+      ...settings.provider_config,
+      id: "provider-created",
+      provider_name: "local",
+      provider: "local",
+      model: "new-model",
+      max_tokens: 2048,
+      context_size: 65536,
+      temperature: 0.7,
+      is_active: false,
+    };
+    api.addProviderConfig.mockResolvedValue(created);
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "添加提供商" }));
+
+    const slider = screen.getByRole("slider", { name: "Temperature" });
+    expect(slider).toHaveAttribute("aria-valuemin", "0");
+    expect(slider).toHaveAttribute("aria-valuemax", "2");
+    expect(slider).toHaveAttribute("aria-valuenow", "0");
+    expect(screen.getByText("Temperature（0.0）")).toBeInTheDocument();
+
+    await userEvent.clear(screen.getByRole("textbox", { name: "配置名称" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "配置名称" }), "local");
+    await userEvent.type(screen.getByRole("textbox", { name: "Base URL" }), "https://example.test/v1");
+    await userEvent.type(screen.getByRole("combobox", { name: "模型" }), "new-model");
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "最大输出 token" }));
+    await userEvent.type(screen.getByRole("spinbutton", { name: "最大输出 token" }), "2048");
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "上下文窗口" }));
+    await userEvent.type(screen.getByRole("spinbutton", { name: "上下文窗口" }), "65536");
+    for (let index = 0; index < 7; index += 1) {
+      fireEvent.keyDown(slider, { key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39 });
+    }
+    expect(slider).toHaveAttribute("aria-valuenow", "0.7");
+    expect(screen.getByText("Temperature（0.7）")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(api.addProviderConfig).toHaveBeenCalledWith({
+      provider_name: "local",
+      protocol: "chat_completions",
+      base_url: "https://example.test/v1",
+      model: "new-model",
+      max_tokens: 2048,
+      context_size: 65536,
+      temperature: 0.7,
+      tokenizer_model: "",
+      api_key: "",
+    }));
+
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/local · new-model/));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "最大输出 token local" }), { target: { value: "4096" } });
+    expect(screen.getByRole("textbox", { name: "配置名称 local" })).toHaveValue("local");
+    expect(screen.getByRole("combobox", { name: "模型 local" })).toHaveValue("new-model");
+    expect(screen.getByRole("spinbutton", { name: "上下文窗口 local" })).toHaveValue(65536);
+    expect(screen.getByRole("slider", { name: "Temperature local" })).toHaveAttribute("aria-valuenow", "0.7");
+  });
+
+  it("updates all model parameters for the current Provider and publishes the saved state", async () => {
+    const updated = {
+      ...settings.provider_config,
+      provider_name: "openai",
+      max_tokens: 4096,
+      context_size: 131072,
+      temperature: 0.7,
+    };
+    api.updateProviderConfigById.mockResolvedValue(updated);
+    const onProviderConfigUpdate = vi.fn();
+    renderModal(vi.fn(), vi.fn(), onProviderConfigUpdate);
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/openai · demo/));
+
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "最大输出 token openai" }));
+    await userEvent.type(screen.getByRole("spinbutton", { name: "最大输出 token openai" }), "4096");
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "上下文窗口 openai" }));
+    await userEvent.type(screen.getByRole("spinbutton", { name: "上下文窗口 openai" }), "131072");
+    const slider = screen.getByRole("slider", { name: "Temperature openai" });
+    for (let index = 0; index < 7; index += 1) {
+      fireEvent.keyDown(slider, { key: "ArrowRight", code: "ArrowRight", keyCode: 39, which: 39 });
+    }
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(api.updateProviderConfigById).toHaveBeenCalledWith("provider-1", {
+      provider_name: "openai",
+      model: "demo",
+      max_tokens: 4096,
+      context_size: 131072,
+      temperature: 0.7,
+    }));
+    expect(onProviderConfigUpdate).toHaveBeenCalledWith(updated);
+  });
+
+  it("keeps Provider model-parameter edits visible when saving fails", async () => {
+    api.updateProviderConfigById.mockRejectedValueOnce(new Error("参数组合无效"));
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/openai · demo/));
+    await userEvent.clear(screen.getByRole("spinbutton", { name: "最大输出 token openai" }));
+    await userEvent.type(screen.getByRole("spinbutton", { name: "最大输出 token openai" }), "2048");
+
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(await screen.findByText("参数组合无效")).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "最大输出 token openai" })).toHaveValue(2048);
+  });
+
+  it("shows detected terminals and saves the selected Ant Design option", async () => {
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "运行配置" }));
+
+    const terminal = screen.getByRole("combobox", { name: "启动终端" });
+    fireEvent.mouseDown(terminal);
+    expect(screen.getByRole("option", { name: "Windows PowerShell" })).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Windows PowerShell", { selector: ".ant-select-item-option-content" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(api.updateRuntimeConfig).toHaveBeenCalledWith({
+      max_tool_calls: 32,
+      max_tool_parellel: 16,
+      terminal_type: "powershell",
+    }));
+  });
+
+  it("shows the complete sandbox configuration without an enabled switch", async () => {
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "沙箱" }));
+
+    expect(screen.queryByRole("combobox", { name: "沙箱文件权限" })).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "沙箱网络权限" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "网络白名单" })).toBeInTheDocument();
+    expect(screen.getByText("暂无白名单规则")).toBeInTheDocument();
+    expect(screen.getAllByRole("spinbutton")).toHaveLength(10);
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /检\s*查/ })).not.toBeInTheDocument();
+    expect(screen.getByText("沙箱已就绪", { exact: true })).toBeInTheDocument();
+    const resourceGrid = screen.getByTestId("sandbox-resource-limits");
+    expect(resourceGrid.children).toHaveLength(7);
+    for (const item of Array.from(resourceGrid.children)) {
+      expect(item).toHaveClass("ant-col-xs-24", "ant-col-sm-12");
+    }
+  });
+
+  it("edits command allowlist rules with an optional port", async () => {
+    const hostOnlySettings = {
+      ...structuredClone(settings),
+      sandbox_config: {
+        ...structuredClone(settings.sandbox_config),
+        network_mode: "restricted_network" as const,
+        network_allowlist: [{ host: "127.0.0.1" }],
+      },
+    };
+    api.getSettings.mockResolvedValue(hostOnlySettings);
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "沙箱" }));
+
+    const host = screen.getByRole("textbox", { name: "白名单主机 1" });
+    const port = screen.getByRole("spinbutton", { name: "白名单端口 1" });
+    expect(host).toHaveValue("127.0.0.1");
+    expect(port).toHaveValue("");
+    expect(screen.getByText(/端口留空时允许该 IP 或域名的全部端口/)).toBeInTheDocument();
+    fireEvent.change(host, { target: { value: "localhost" } });
+    fireEvent.change(port, { target: { value: "443" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(api.updateSandboxConfig).toHaveBeenCalledTimes(1));
+    expect(api.updateSandboxConfig.mock.calls[0][0].network_allowlist).toEqual([{ host: "localhost", port: 443 }]);
+  });
+
+  it("confirms before applying aggregate limits below current usage", async () => {
+    vi.mocked(sandboxApi.getSandboxResources).mockResolvedValue({
+      usage: { memory_bytes: 10 * 1048576, processes: 5, handles: 10 },
+      limits: { memory_mib: 8192, processes: 512, handles: 32768 }, queued: 1,
+    });
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "沙箱" }));
+    const input = await screen.findByRole("spinbutton", { name: "总进程数" });
+    await waitFor(() => expect(input).toHaveValue("512"));
+    fireEvent.change(input, { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await screen.findAllByText("降低总资源上限？");
+    expect(api.updateSandboxConfig).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /取\s*消/ }));
+    await waitFor(() => expect(screen.queryAllByText("降低总资源上限？")).toHaveLength(0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "保存" })).not.toHaveClass("ant-btn-loading"));
+    expect(api.updateSandboxConfig).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await userEvent.click(await screen.findByRole("button", { name: "保存并应用" }));
+    await waitFor(() => expect(api.updateSandboxConfig).toHaveBeenCalledTimes(1));
+    expect(api.updateSandboxConfig.mock.calls[0][0].aggregate_limits.processes).toBe(2);
+  });
+
+  it("saves command network policy independently from Turn file permission", async () => {
+    renderModal();
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "沙箱" }));
+
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "沙箱网络权限" }));
+    fireEvent.click(await screen.findByText("完整网络", { selector: ".ant-select-item-option-content" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(api.updateSandboxConfig).toHaveBeenCalledTimes(1));
+    const payload = api.updateSandboxConfig.mock.calls[0][0];
+    expect(payload).toMatchObject({
+      network_mode: "full_network",
+      proxy_port: 17831,
+    });
+    expect(payload).not.toHaveProperty("file_mode");
+    expect(payload).not.toHaveProperty("full_access_acknowledged");
+    expect(payload).not.toHaveProperty("enabled");
+  });
+
+  it("checks dirty state for mask and close button but keeps Escape disabled", async () => {
+    const onClose = vi.fn();
+    renderModal(onClose);
+    await screen.findByDisplayValue("旧名字");
+
+    const mask = document.querySelector(".ant-modal-mask");
+    const modalWrap = document.querySelector(".ant-modal-wrap");
+    if (!mask || !modalWrap) throw new Error("modal mask not rendered");
+    fireEvent.mouseDown(modalWrap);
+    fireEvent.click(modalWrap);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    onClose.mockClear();
+    const name = screen.getByDisplayValue("旧名字");
+    await userEvent.clear(name);
+    await userEvent.type(name, "未保存");
+    fireEvent.mouseDown(modalWrap);
+    fireEvent.click(modalWrap);
+    expect(document.querySelector(".ant-modal-confirm-title")).toHaveTextContent("退出用户设置？");
+    await userEvent.click(screen.getByRole("button", { name: "继续编辑" }));
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "继续编辑" })).not.toBeInTheDocument());
+    fireEvent.mouseDown(modalWrap);
+    fireEvent.click(modalWrap);
+    await userEvent.click(screen.getByRole("button", { name: /退/ }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(document.querySelector(".ant-modal-confirm-title")).toHaveTextContent("退出用户设置？");
+  });
+
+  it("saves the profile and updates the sidebar user immediately", async () => {
+    const onProfileChange = vi.fn();
+    renderModal(vi.fn(), onProfileChange);
+    const name = await screen.findByDisplayValue("旧名字");
+    await userEvent.clear(name);
+    await userEvent.type(name, "新名字");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(api.updateProfile).toHaveBeenCalledWith({
+      display_name: "新名字",
+      agent_preferences: "",
+    }));
+    expect(onProfileChange).toHaveBeenCalledWith({ display_name: "新名字", agent_preferences: "" });
+    expect(screen.getByDisplayValue("新名字")).toBeInTheDocument();
+    expect(await screen.findByText("保存成功")).toBeInTheDocument();
+  });
+
+  it("does not show a success message when saving fails", async () => {
+    api.updateProfile.mockRejectedValueOnce(new Error("保存失败"));
+    renderModal();
+    const name = await screen.findByDisplayValue("旧名字");
+    await userEvent.clear(name);
+    await userEvent.type(name, "新名字");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByText("保存失败")).toBeInTheDocument();
+    expect(screen.queryByText("保存成功")).not.toBeInTheDocument();
+  });
+
+  it("switches the current Provider and model from user settings", async () => {
+    const nextProvider = {
+      ...settings.provider_config,
+      id: "provider-2",
+      is_active: false,
+      provider: "anthropic",
+      provider_name: "anthropic",
+      protocol: "messages" as const,
+      model: "claude-settings",
+    };
+    api.getSettings.mockResolvedValue({
+      ...structuredClone(settings),
+      provider_configs: [structuredClone(settings.provider_config), nextProvider],
+    });
+    api.activateProviderConfig.mockResolvedValue({ ...nextProvider, is_active: true });
+    const onProviderConfigUpdate = vi.fn();
+    renderModal(vi.fn(), vi.fn(), onProviderConfigUpdate);
+
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/anthropic · claude-settings/));
+    await userEvent.click(screen.getByRole("button", { name: "设为当前使用" }));
+
+    await waitFor(() => expect(api.activateProviderConfig).toHaveBeenCalledWith("provider-2"));
+    expect(onProviderConfigUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      provider_name: "anthropic",
+      model: "claude-settings",
+      is_active: true,
+    }));
+  });
+
+  it("opens every discovered model before filtering and keeps selection editable", async () => {
+    api.discoverProviderModels.mockResolvedValueOnce({
+      models: ["alpha-model", "beta-model"],
+    });
+    renderModal();
+
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/openai · demo/));
+    await userEvent.click(screen.getByRole("button", { name: "获取 /v1\/models" }));
+
+    await waitFor(() => expect(api.discoverProviderModels).toHaveBeenCalledWith({
+      config_id: "provider-1",
+      provider_name: "openai",
+      protocol: "chat_completions",
+      base_url: "https://example.test/v1",
+      api_key: "",
+    }));
+    expect(await screen.findByText("已获取 2 个模型")).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "alpha-model" })).toBeInTheDocument();
+
+    const modelInput = screen.getByDisplayValue("demo");
+    await userEvent.clear(modelInput);
+    await userEvent.type(modelInput, "beta");
+    expect(screen.queryByRole("option", { name: "alpha-model" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("beta-model", { selector: ".ant-select-item-option-content" }));
+    await waitFor(() => expect(modelInput).toHaveValue("beta-model"));
+    await waitFor(() => expect(screen.queryByRole("option", { name: "beta-model" })).not.toBeInTheDocument());
+  });
+
+  it("shows empty and failed discovery results on their own Providers", async () => {
+    const nextProvider = {
+      ...settings.provider_config,
+      id: "provider-2",
+      is_active: false,
+      provider: "anthropic",
+      provider_name: "anthropic",
+      protocol: "messages" as const,
+      model: "claude-settings",
+    };
+    api.getSettings.mockResolvedValue({
+      ...structuredClone(settings),
+      provider_configs: [structuredClone(settings.provider_config), nextProvider],
+    });
+    api.discoverProviderModels
+      .mockResolvedValueOnce({ models: [] })
+      .mockRejectedValueOnce(new Error("密钥无效"));
+    renderModal();
+
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/openai · demo/));
+    await userEvent.click(screen.getByText(/anthropic · claude-settings/));
+    const discoverButtons = screen.getAllByRole("button", { name: "获取 /v1\/models" });
+    await userEvent.click(discoverButtons[0]);
+    expect(await screen.findByText("模型服务没有返回可用模型，请继续手动输入。")).toBeInTheDocument();
+    await userEvent.click(discoverButtons[1]);
+
+    expect(await screen.findByText("密钥无效")).toBeInTheDocument();
+    expect(screen.getByText("模型服务没有返回可用模型，请继续手动输入。")).toBeInTheDocument();
+  });
+
+  it("clears managed model feedback when settings close", async () => {
+    api.discoverProviderModels.mockResolvedValueOnce({ models: ["alpha-model"] });
+    const view = renderModal();
+
+    await screen.findByDisplayValue("旧名字");
+    await userEvent.click(screen.getByRole("menuitem", { name: "Provider 与模型" }));
+    await userEvent.click(screen.getByText(/openai · demo/));
+    await userEvent.click(screen.getByRole("button", { name: "获取 /v1\/models" }));
+    expect(await screen.findByText("已获取 1 个模型")).toBeInTheDocument();
+
+    view.rerender(modalElement(false));
+    view.rerender(modalElement(true));
+    await screen.findByRole("heading", { name: "Provider 与模型" });
+    await waitFor(() => expect(screen.queryByText("已获取 1 个模型")).not.toBeInTheDocument());
+  });
+});
