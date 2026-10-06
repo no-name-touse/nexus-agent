@@ -1,7 +1,5 @@
 # Nexus Agent
 
-Local AI Agent workspace. This version is adapted from [Praxis](https://github.com/Guan0923/Praxis); the display name is Nexus Agent. The original MIT license and copyright are preserved in [LICENSE](LICENSE). Internal package names, data paths, protocol headers, and sandbox service identifiers are retained for compatibility.
-
 **Turn ideas into action. On your machine. On your terms.**
 
 Nexus Agent is a personal AI workspace that runs locally and opens in your browser. Give it a task, bring in your files, and work through it together: inspect a project, change code, run commands, or gather information from the web. Follow the work as it happens, with plans, tool results, and permission decisions in the conversation.
