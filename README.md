@@ -1,10 +1,22 @@
-# Nexus Agent
+# Nexus Agent——本地 AI Agent 工作空间
 
 Local AI Agent workspace. This version is adapted from [Praxis](https://github.com/Guan0923/Praxis); the display name is Nexus Agent. The original MIT license and copyright are preserved in [LICENSE](LICENSE). Internal package names, data paths, protocol headers, and sandbox service identifiers are retained for compatibility.
 
 **Turn ideas into action. On your machine. On your terms.**
 
 Nexus Agent is a personal AI workspace that runs locally and opens in your browser. Give it a task, bring in your files, and work through it together: inspect a project, change code, run commands, or gather information from the web. Follow the work as it happens, with plans, tool results, and permission decisions in the conversation.
+
+## Project profile
+
+Nexus Agent is a local-first Agent runtime and browser workspace. Its core loop combines Plan/Agent modes, a model provider layer, a schema-driven ToolRegistry, approval-aware execution, session persistence, and a Windows sandbox. External capabilities are connected through a generic MCP client, so a server can be added through configuration without coupling its Python implementation to the Agent runtime.
+
+The repository also contains the production integration for the companion **Atlas RAG——hybrid retrieval and knowledge service** project. Nexus starts Atlas's stdio MCP adapter, discovers its `search` tool, and receives evidence with `source` and `chunk_id`; Atlas keeps document ingestion, BGE-M3 embeddings, BM25, Qdrant, and reranking in its own process. This keeps the Agent responsible for deciding when to retrieve and how to answer, while the RAG service remains independently deployable.
+
+```text
+Nexus Agent -> generic MCP client (stdio) -> Atlas rag-mcp -> HTTP -> rag-service -> Qdrant
+```
+
+This separation is covered by [the Atlas integration guide](docs/atlas-rag-integration.md) and the cross-process test in `tests/test_atlas_rag_mcp.py`.
 
 **English** | [简体中文](README.zh-CN.md)
 

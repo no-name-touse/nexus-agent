@@ -1,4 +1,4 @@
-"""Praxis: a terminal-first agent execution lab."""
+"""Nexus Agent: a local-first Agent runtime and execution workspace."""
 
 from __future__ import annotations
 
