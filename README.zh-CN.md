@@ -18,8 +18,8 @@ Nexus Agent -> 通用 MCP Client（stdio）-> Atlas rag-mcp -> HTTP -> rag-servi
 
 [English](README.md) | **简体中文**
 
-<!-- DEMO: 将 GIF 放到 docs/assets/praxis-demo.gif，然后取消下面图片的注释。
-![Praxis：从提出任务，到讨论计划、调用工具，再到完成结果](docs/assets/praxis-demo.gif)
+<!-- DEMO: 将 GIF 放到 docs/assets/Nexus-demo.gif，然后取消下面图片的注释。
+![Nexus：从提出任务，到讨论计划、调用工具，再到完成结果](docs/assets/Nexus-demo.gif)
 -->
 
 ## 带来一个任务，不只是一个问题
@@ -87,10 +87,10 @@ npm run dev
 
 ## 数据与权限
 
-- **保存在本机：**配置、项目、聊天历史和工作区文件使用 `~/.praxis`。模型服务的 API Key 加密后保存，不写进 TOML 配置文件。
+- **保存在本机：**配置、项目、聊天历史和工作区文件使用 `~/.Nexus`。模型服务的 API Key 加密后保存，不写进 TOML 配置文件。
 - **本地不等于离线：**使用在线模型时，相关请求内容会发送给所选服务。网页工具和外部 MCP 服务也可能向外发送数据，请按任务选择服务与权限。
 - **没有应用登录：**Nexus Agent 面向本机单用户使用，不是共享的公网服务。模型服务和外部工具可能需要各自的凭据。
-- **作为新安装使用：**这个版本不导入旧安装的数据或密钥。现有用户需要重新配置 Praxis，具体说明见[安装说明](docs/development.md#praxis-installation)。
+- **作为新安装使用：**这个版本不导入旧安装的数据或密钥。现有用户需要重新配置 Nexus，具体说明见[安装说明](docs/development.md#Nexus-installation)。
 
 ## 深入了解
 
