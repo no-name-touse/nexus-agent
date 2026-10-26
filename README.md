@@ -18,8 +18,8 @@ This separation is covered by [the Atlas integration guide](docs/atlas-rag-integ
 
 **English** | [简体中文](README.zh-CN.md)
 
-<!-- DEMO: Add docs/assets/praxis-demo.gif, then uncomment the image below.
-![Praxis: from a task to a plan, tool execution, and a finished result](docs/assets/praxis-demo.gif)
+<!-- DEMO: Add docs/assets/nexus-demo.gif, then uncomment the image below.
+![nexus: from a task to a plan, tool execution, and a finished result](docs/assets/nexus-demo.gif)
 -->
 
 ## Bring a task, not just a question
@@ -88,10 +88,10 @@ For a single-server setup, build the frontend with `npm run build` inside `front
 
 ## Your data and your permissions
 
-- **Stored locally:** configuration, projects, conversation history, and workspace files use `~/.praxis`. Provider API keys are encrypted before storage; they are not kept in the configuration TOML file.
+- **Stored locally:** configuration, projects, conversation history, and workspace files use `~/.nexus`. Provider API keys are encrypted before storage; they are not kept in the configuration TOML file.
 - **Local does not mean offline:** an online model receives the relevant request content. Web tools and external MCP servers may also send data outside your machine. Choose services and permissions to match the task.
 - **No application login:** Nexus Agent is a local, single-user app, not a shared internet-facing service. Model providers and external tools may require their own credentials.
-- **A fresh installation identity:** this release does not import previous installation data or credentials. Existing users need to configure the application again; see the [installation notes](docs/development.md#praxis-installation).
+- **A fresh installation identity:** this release does not import previous installation data or credentials. Existing users need to configure the application again; see the [installation notes](docs/development.md#nexus-installation).
 
 ## Go deeper
 
